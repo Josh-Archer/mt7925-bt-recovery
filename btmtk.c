@@ -1338,11 +1338,12 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 		err = btmtk_setup_firmware_79xx(hdev, fw_bin_name,
 						btmtk_usb_hci_wmt_sync);
 		if (err < 0) {
-			/* Recover once from a MT7925 firmware-download timeout. */
-			if (dev_id == 0x7925 &&
-			    !test_and_set_bit(BTMTK_FIRMWARE_DL_RETRY,
-					      &btmtk_data->flags))
+			/* Recover from a MT7925 firmware-download timeout. */
+			if (dev_id == 0x7925) {
+				set_bit(BTMTK_FIRMWARE_DL_RETRY,
+					&btmtk_data->flags);
 				btmtk_reset_sync(hdev);
+			}
 
 			bt_dev_err(hdev, "Failed to set up firmware (%d)", err);
 			return err;

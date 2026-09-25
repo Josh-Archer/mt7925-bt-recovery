@@ -13,3 +13,6 @@ arch/
 Module.markers
 modules.order
 Module.symvers
+__pycache__/
+*.pyc
+tests/test_retry_logic
