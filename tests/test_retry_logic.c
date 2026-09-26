@@ -6,36 +6,15 @@
 
 #define BIT(nr) (1UL << (nr))
 
+#define BTMTK_FW_DL_MAX_RETRIES 3
+
 enum {
 	BTMTK_TX_WAIT_VND_EVT,
 	BTMTK_FIRMWARE_LOADED,
 	BTMTK_HW_RESET_ACTIVE,
 	BTMTK_ISOPKT_OVER_INTR,
 	BTMTK_ISOPKT_RUNNING,
-	BTMTK_FIRMWARE_DL_RETRY,
 };
-
-static inline void set_bit(int nr, unsigned long *addr)
-{
-	*addr |= BIT(nr);
-}
-
-static inline void clear_bit(int nr, unsigned long *addr)
-{
-	*addr &= ~BIT(nr);
-}
-
-static inline int test_bit(int nr, const unsigned long *addr)
-{
-	return (*addr & BIT(nr)) != 0;
-}
-
-static inline int test_and_clear_bit(int nr, unsigned long *addr)
-{
-	int old = test_bit(nr, addr);
-	clear_bit(nr, addr);
-	return old;
-}
 
 struct hci_dev {
 	const char *name;
@@ -44,6 +23,7 @@ struct hci_dev {
 struct btmtk_data {
 	unsigned long flags;
 	uint32_t dev_id;
+	uint32_t fw_dl_retries;
 	int reset_calls;
 };
 
@@ -57,10 +37,14 @@ static int btmtk_usb_setup_fw_handler(struct hci_dev *hdev, struct btmtk_data *b
 				      uint32_t dev_id, int fw_err)
 {
 	if (fw_err < 0) {
-		/* Recover from a MT7925 firmware-download timeout. */
+		/* Recover from a MT7925 firmware-download failure up to retry limit. */
 		if (dev_id == 0x7925) {
-			set_bit(BTMTK_FIRMWARE_DL_RETRY, &btmtk_data->flags);
-			btmtk_reset_sync(hdev, btmtk_data);
+			if (btmtk_data->fw_dl_retries < BTMTK_FW_DL_MAX_RETRIES) {
+				btmtk_data->fw_dl_retries++;
+				btmtk_reset_sync(hdev, btmtk_data);
+			} else {
+				/* Limit reached: return error without resetting */
+			}
 		}
 		return fw_err;
 	}
@@ -69,79 +53,127 @@ static int btmtk_usb_setup_fw_handler(struct hci_dev *hdev, struct btmtk_data *b
 
 static void btmtk_usb_setup_complete(struct btmtk_data *btmtk_data)
 {
-	test_and_clear_bit(BTMTK_FIRMWARE_DL_RETRY, &btmtk_data->flags);
+	btmtk_data->fw_dl_retries = 0;
 }
 
-static void test_initial_failure_triggers_reset_and_keeps_retry(void)
+static void test_repeated_failures_reset_at_most_max_times(void)
 {
 	struct hci_dev hdev = { .name = "hci0" };
-	struct btmtk_data data = { .flags = 0, .reset_calls = 0 };
+	struct btmtk_data data = { .flags = 0, .dev_id = 0x7925, .fw_dl_retries = 0, .reset_calls = 0 };
+	int ret;
 
-	int ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
+	/* 1st failure: reset requested, counter increments to 1 */
+	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
 	assert(ret == -110);
 	assert(data.reset_calls == 1);
-	assert(test_bit(BTMTK_FIRMWARE_DL_RETRY, &data.flags));
-	printf("PASS: test_initial_failure_triggers_reset_and_keeps_retry\n");
-}
+	assert(data.fw_dl_retries == 1);
 
-static void test_subsequent_failure_still_triggers_reset(void)
-{
-	struct hci_dev hdev = { .name = "hci0" };
-	struct btmtk_data data = { .flags = 0, .reset_calls = 0 };
-
-	/* First firmware-download failure triggers reset and sets retry flag */
-	btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
-	assert(data.reset_calls == 1);
-	assert(test_bit(BTMTK_FIRMWARE_DL_RETRY, &data.flags));
-
-	/* Second firmware-download failure after reset does NOT spend the only retry */
-	int ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
+	/* 2nd failure: reset requested, counter increments to 2 */
+	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
 	assert(ret == -110);
 	assert(data.reset_calls == 2);
-	assert(test_bit(BTMTK_FIRMWARE_DL_RETRY, &data.flags));
+	assert(data.fw_dl_retries == 2);
 
-	/* Third failure still triggers reset */
+	/* 3rd failure: reset requested, counter increments to 3 (MAX reached) */
 	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
 	assert(ret == -110);
 	assert(data.reset_calls == 3);
-	assert(test_bit(BTMTK_FIRMWARE_DL_RETRY, &data.flags));
-	printf("PASS: test_subsequent_failure_still_triggers_reset\n");
+	assert(data.fw_dl_retries == 3);
+
+	/* 4th failure: limit reached, NO reset requested, counter stays 3 */
+	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
+	assert(ret == -110);
+	assert(data.reset_calls == 3);
+	assert(data.fw_dl_retries == 3);
+
+	/* 5th failure: still no reset requested */
+	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
+	assert(ret == -110);
+	assert(data.reset_calls == 3);
+	assert(data.fw_dl_retries == 3);
+
+	printf("PASS: test_repeated_failures_reset_at_most_max_times\n");
 }
 
-static void test_setup_completion_clears_retry_flag(void)
+static void test_success_rearms_recovery(void)
 {
 	struct hci_dev hdev = { .name = "hci0" };
-	struct btmtk_data data = { .flags = 0, .reset_calls = 0 };
+	struct btmtk_data data = { .flags = 0, .dev_id = 0x7925, .fw_dl_retries = 0, .reset_calls = 0 };
+	int ret;
 
-	/* First firmware failure */
+	/* Fail twice */
 	btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
-	assert(test_bit(BTMTK_FIRMWARE_DL_RETRY, &data.flags));
+	btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
+	assert(data.reset_calls == 2);
+	assert(data.fw_dl_retries == 2);
 
-	/* Next attempt succeeds and setup completes */
-	int ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, 0);
+	/* Setup succeeds */
+	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, 0);
 	assert(ret == 0);
 	btmtk_usb_setup_complete(&data);
-	assert(!test_bit(BTMTK_FIRMWARE_DL_RETRY, &data.flags));
-	printf("PASS: test_setup_completion_clears_retry_flag\n");
+	assert(data.fw_dl_retries == 0);
+	assert(data.reset_calls == 2);
+
+	/* Now failure occurs again: recovery must be re-armed */
+	for (int i = 1; i <= BTMTK_FW_DL_MAX_RETRIES; i++) {
+		ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
+		assert(ret == -110);
+		assert(data.reset_calls == 2 + i);
+		assert(data.fw_dl_retries == (uint32_t)i);
+	}
+
+	/* Subsequent failure stops resetting */
+	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
+	assert(ret == -110);
+	assert(data.reset_calls == 2 + BTMTK_FW_DL_MAX_RETRIES);
+	assert(data.fw_dl_retries == BTMTK_FW_DL_MAX_RETRIES);
+
+	printf("PASS: test_success_rearms_recovery\n");
+}
+
+static void test_exhaustion_then_success_rearms(void)
+{
+	struct hci_dev hdev = { .name = "hci0" };
+	struct btmtk_data data = { .flags = 0, .dev_id = 0x7925, .fw_dl_retries = 0, .reset_calls = 0 };
+
+	/* Exhaust all retries */
+	for (int i = 0; i < BTMTK_FW_DL_MAX_RETRIES + 2; i++) {
+		btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
+	}
+	assert(data.reset_calls == BTMTK_FW_DL_MAX_RETRIES);
+	assert(data.fw_dl_retries == BTMTK_FW_DL_MAX_RETRIES);
+
+	/* Setup completes successfully, re-arming recovery */
+	btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, 0);
+	btmtk_usb_setup_complete(&data);
+	assert(data.fw_dl_retries == 0);
+	assert(data.reset_calls == BTMTK_FW_DL_MAX_RETRIES);
+
+	/* Next failure triggers reset */
+	btmtk_usb_setup_fw_handler(&hdev, &data, 0x7925, -110);
+	assert(data.reset_calls == BTMTK_FW_DL_MAX_RETRIES + 1);
+	assert(data.fw_dl_retries == 1);
+
+	printf("PASS: test_exhaustion_then_success_rearms\n");
 }
 
 static void test_other_dev_ids_not_affected(void)
 {
 	struct hci_dev hdev = { .name = "hci0" };
-	struct btmtk_data data = { .flags = 0, .reset_calls = 0 };
+	struct btmtk_data data = { .flags = 0, .dev_id = 0x7961, .fw_dl_retries = 0, .reset_calls = 0 };
 
 	int ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7961, -110);
 	assert(ret == -110);
 	assert(data.reset_calls == 0);
-	assert(!test_bit(BTMTK_FIRMWARE_DL_RETRY, &data.flags));
+	assert(data.fw_dl_retries == 0);
 	printf("PASS: test_other_dev_ids_not_affected\n");
 }
 
 int main(void)
 {
-	test_initial_failure_triggers_reset_and_keeps_retry();
-	test_subsequent_failure_still_triggers_reset();
-	test_setup_completion_clears_retry_flag();
+	test_repeated_failures_reset_at_most_max_times();
+	test_success_rearms_recovery();
+	test_exhaustion_then_success_rearms();
 	test_other_dev_ids_not_affected();
 	printf("All C retry logic unit tests passed successfully.\n");
 	return 0;

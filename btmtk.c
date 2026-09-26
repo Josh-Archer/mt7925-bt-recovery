@@ -1338,11 +1338,16 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 		err = btmtk_setup_firmware_79xx(hdev, fw_bin_name,
 						btmtk_usb_hci_wmt_sync);
 		if (err < 0) {
-			/* Recover from a MT7925 firmware-download timeout. */
+			/* Recover from a MT7925 firmware-download failure up to retry limit. */
 			if (dev_id == 0x7925) {
-				set_bit(BTMTK_FIRMWARE_DL_RETRY,
-					&btmtk_data->flags);
-				btmtk_reset_sync(hdev);
+				if (btmtk_data->fw_dl_retries < BTMTK_FW_DL_MAX_RETRIES) {
+					btmtk_data->fw_dl_retries++;
+					btmtk_reset_sync(hdev);
+				} else {
+					bt_dev_err(hdev,
+						   "Firmware download failed: max retries (%d) reached, skipping reset",
+						   BTMTK_FW_DL_MAX_RETRIES);
+				}
 			}
 
 			bt_dev_err(hdev, "Failed to set up firmware (%d)", err);
@@ -1375,7 +1380,7 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 
 		hci_set_msft_opcode(hdev, 0xFD30);
 		hci_set_aosp_capable(hdev);
-		test_and_clear_bit(BTMTK_FIRMWARE_DL_RETRY, &btmtk_data->flags);
+		btmtk_data->fw_dl_retries = 0;
 
 		/* Set up ISO interface after protocol enabled */
 		if (test_bit(BTMTK_ISOPKT_OVER_INTR, &btmtk_data->flags)) {
