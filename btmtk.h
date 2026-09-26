@@ -141,13 +141,14 @@ struct btmtk_hci_wmt_params {
 	u32 *status;
 };
 
+#define BTMTK_FW_DL_MAX_RETRIES		3
+
 enum {
 	BTMTK_TX_WAIT_VND_EVT,
 	BTMTK_FIRMWARE_LOADED,
 	BTMTK_HW_RESET_ACTIVE,
 	BTMTK_ISOPKT_OVER_INTR,
 	BTMTK_ISOPKT_RUNNING,
-	BTMTK_FIRMWARE_DL_RETRY,
 };
 
 typedef int (*btmtk_reset_sync_func_t)(struct hci_dev *, void *);
@@ -163,6 +164,7 @@ struct btmtk_data {
 	const char *drv_name;
 	unsigned long flags;
 	u32 dev_id;
+	u32 fw_dl_retries;
 	btmtk_reset_sync_func_t reset_sync;
 	struct btmtk_coredump_info cd_info;
 
