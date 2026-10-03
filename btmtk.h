@@ -142,6 +142,7 @@ struct btmtk_hci_wmt_params {
 };
 
 #define BTMTK_FW_DL_MAX_RETRIES		3
+#define BTMTK_WMT_MAX_RETRIES		3
 
 enum {
 	BTMTK_TX_WAIT_VND_EVT,
@@ -165,6 +166,7 @@ struct btmtk_data {
 	unsigned long flags;
 	u32 dev_id;
 	u32 fw_dl_retries;
+	u32 wmt_retries;
 	btmtk_reset_sync_func_t reset_sync;
 	struct btmtk_coredump_info cd_info;
 

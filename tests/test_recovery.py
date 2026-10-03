@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Automated tests for MT7925 Bluetooth recovery driver (issue #2 fix).
+Automated tests for MT7925 Bluetooth recovery driver (issues #2 and #3).
 
 Validates:
 1. C retry logic compiles and runs all test cases (verifying that repeated firmware
-   download failures reset at most MAX times, then stop, and successful setup re-arms).
+   download failures and WMT timeouts reset at most MAX times, then stop, and successful
+   setup re-arms).
 2. Source-level checks on btmtk.c and btmtk.h to verify that:
-   - BTMTK_FW_DL_MAX_RETRIES is defined in btmtk.h.
-   - fw_dl_retries counter is defined in struct btmtk_data.
+   - BTMTK_FW_DL_MAX_RETRIES and BTMTK_WMT_MAX_RETRIES are defined in btmtk.h.
+   - fw_dl_retries and wmt_retries counters are defined in struct btmtk_data.
    - Firmware download failure path bounds reset attempts by BTMTK_FW_DL_MAX_RETRIES.
-   - Counter is incremented only when a reset is requested.
-   - Clear log message is issued when retry limit is reached.
-   - Setup completion resets the retry counter to 0 (re-arming recovery).
+   - WMT func-ctrl timeout path bounds reset attempts by BTMTK_WMT_MAX_RETRIES.
+   - Counters are incremented only when a reset is requested.
+   - Clear log messages are issued when retry limits are reached.
+   - Setup completion resets both retry counters to 0 (re-arming recovery).
    - Old single-bit test_and_set_bit retry spending is eliminated.
-3. Python behavioral simulation modeling bounded counter and re-arm logic.
+3. Python behavioral simulation modeling bounded counters and re-arm logic for both
+   firmware download failures and WMT func-ctrl timeouts.
 4. Clean compilation against installed kernel headers without loading modules
    or touching the host's Bluetooth system.
 """
@@ -45,6 +48,12 @@ class TestSourceIntegrity(unittest.TestCase):
         self.assertIsNotNone(match, "BTMTK_FW_DL_MAX_RETRIES must be defined in btmtk.h")
         self.assertEqual(int(match.group(1)), 3, "BTMTK_FW_DL_MAX_RETRIES should be 3")
 
+    def test_wmt_max_retries_defined_in_header(self):
+        """Ensure BTMTK_WMT_MAX_RETRIES is defined as a bounded integer in btmtk.h."""
+        match = re.search(r"#define\s+BTMTK_WMT_MAX_RETRIES\s+(\d+)", self.btmtk_h)
+        self.assertIsNotNone(match, "BTMTK_WMT_MAX_RETRIES must be defined in btmtk.h")
+        self.assertEqual(int(match.group(1)), 3, "BTMTK_WMT_MAX_RETRIES should be 3")
+
     def test_counter_in_btmtk_data(self):
         """Ensure fw_dl_retries counter is a member of struct btmtk_data."""
         struct_match = re.search(
@@ -56,6 +65,19 @@ class TestSourceIntegrity(unittest.TestCase):
             "fw_dl_retries",
             struct_body,
             "fw_dl_retries counter must be a field in struct btmtk_data",
+        )
+
+    def test_wmt_counter_in_btmtk_data(self):
+        """Ensure wmt_retries counter is a member of struct btmtk_data."""
+        struct_match = re.search(
+            r"struct\s+btmtk_data\s*\{([^}]+)\};", self.btmtk_h, re.DOTALL
+        )
+        self.assertIsNotNone(struct_match, "struct btmtk_data definition should exist in btmtk.h")
+        struct_body = struct_match.group(1)
+        self.assertIn(
+            "wmt_retries",
+            struct_body,
+            "wmt_retries counter must be a field in struct btmtk_data",
         )
 
     def test_no_test_and_set_bit_on_fw_download_failure(self):
@@ -93,23 +115,59 @@ class TestSourceIntegrity(unittest.TestCase):
             "fw_dl_retries must be incremented when reset is requested",
         )
 
-    def test_limit_reached_logging(self):
-        """Ensure clear logging when firmware download retry limit is reached."""
-        self.assertIn(
-            "max retries",
-            self.btmtk_c.lower(),
-            "btmtk.c must log clearly when max retries is reached",
-        )
-
-    def test_counter_reset_on_setup_completion(self):
-        """Ensure retry counter is reset to 0 once setup fully completes."""
+    def test_wmt_timeout_bounded_reset(self):
+        """Ensure MT7925 WMT func-ctrl timeout checks retry limit before reset."""
         pattern = re.compile(
-            r"btmtk_data->fw_dl_retries\s*=\s*0\s*;",
+            r"if\s*\(\s*dev_id\s*==\s*0x7925\s*&&\s*err\s*==\s*-ETIMEDOUT\s*\)\s*\{[^}]*wmt_retries\s*<\s*BTMTK_WMT_MAX_RETRIES[^}]*btmtk_reset_sync\s*\(\s*hdev\s*\)\s*;",
+            re.DOTALL,
         )
         self.assertRegex(
             self.btmtk_c,
             pattern,
+            "MT7925 WMT func ctrl timeout path must guard btmtk_reset_sync with wmt_retries < BTMTK_WMT_MAX_RETRIES",
+        )
+
+    def test_wmt_timeout_increments_counter(self):
+        """Ensure wmt_retries is incremented when requesting a reset on WMT func ctrl timeout."""
+        pattern = re.compile(
+            r"wmt_retries\s*\+\+|wmt_retries\s*\+=\s*1",
+        )
+        self.assertRegex(
+            self.btmtk_c,
+            pattern,
+            "wmt_retries must be incremented when reset is requested on WMT timeout",
+        )
+
+    def test_limit_reached_logging(self):
+        """Ensure clear logging when firmware download and WMT retry limits are reached."""
+        self.assertIn(
+            "firmware download failed: max retries",
+            self.btmtk_c.lower(),
+            "btmtk.c must log clearly when firmware download max retries is reached",
+        )
+        self.assertIn(
+            "wmt func ctrl failed: max retries",
+            self.btmtk_c.lower(),
+            "btmtk.c must log clearly when WMT func ctrl max retries is reached",
+        )
+
+    def test_counter_reset_on_setup_completion(self):
+        """Ensure retry counters are reset to 0 once setup fully completes."""
+        pattern_fw = re.compile(
+            r"btmtk_data->fw_dl_retries\s*=\s*0\s*;",
+        )
+        self.assertRegex(
+            self.btmtk_c,
+            pattern_fw,
             "Setup completion path must reset btmtk_data->fw_dl_retries to 0",
+        )
+        pattern_wmt = re.compile(
+            r"btmtk_data->wmt_retries\s*=\s*0\s*;",
+        )
+        self.assertRegex(
+            self.btmtk_c,
+            pattern_wmt,
+            "Setup completion path must reset btmtk_data->wmt_retries to 0",
         )
 
 
@@ -122,6 +180,7 @@ class TestBoundedRetryLogicModel(unittest.TestCase):
         def __init__(self, dev_id=0x7925):
             self.dev_id = dev_id
             self.fw_dl_retries = 0
+            self.wmt_retries = 0
             self.reset_count = 0
 
         def setup_fw_handler(self, fw_err):
@@ -135,8 +194,20 @@ class TestBoundedRetryLogicModel(unittest.TestCase):
                 return fw_err
             return 0
 
+        def setup_wmt_handler(self, wmt_err):
+            if wmt_err < 0:
+                if self.dev_id == 0x7925 and wmt_err == -110:
+                    if self.wmt_retries < TestBoundedRetryLogicModel.MAX_RETRIES:
+                        self.wmt_retries += 1
+                        self.reset_count += 1
+                    else:
+                        pass  # Limit reached: no reset
+                return wmt_err
+            return 0
+
         def setup_complete(self):
             self.fw_dl_retries = 0
+            self.wmt_retries = 0
 
     def test_repeated_failures_bounded_at_max(self):
         dev = self.BtkMtkDevice()
@@ -197,6 +268,78 @@ class TestBoundedRetryLogicModel(unittest.TestCase):
         self.assertEqual(ret, -110)
         self.assertEqual(dev.reset_count, 0)
         self.assertEqual(dev.fw_dl_retries, 0)
+
+    def test_wmt_repeated_timeouts_bounded_at_max(self):
+        dev = self.BtkMtkDevice()
+        for i in range(1, self.MAX_RETRIES + 1):
+            ret = dev.setup_wmt_handler(-110)
+            self.assertEqual(ret, -110)
+            self.assertEqual(dev.reset_count, i)
+            self.assertEqual(dev.wmt_retries, i)
+
+        # Additional timeouts after reaching max do not trigger further resets
+        for _ in range(5):
+            ret = dev.setup_wmt_handler(-110)
+            self.assertEqual(ret, -110)
+            self.assertEqual(dev.reset_count, self.MAX_RETRIES)
+            self.assertEqual(dev.wmt_retries, self.MAX_RETRIES)
+
+    def test_wmt_non_timeout_does_not_reset(self):
+        dev = self.BtkMtkDevice()
+        ret = dev.setup_wmt_handler(-22)
+        self.assertEqual(ret, -22)
+        self.assertEqual(dev.reset_count, 0)
+        self.assertEqual(dev.wmt_retries, 0)
+
+        ret = dev.setup_wmt_handler(-5)
+        self.assertEqual(ret, -5)
+        self.assertEqual(dev.reset_count, 0)
+        self.assertEqual(dev.wmt_retries, 0)
+
+    def test_wmt_setup_success_rearms_recovery(self):
+        dev = self.BtkMtkDevice()
+        # Timeout twice
+        dev.setup_wmt_handler(-110)
+        dev.setup_wmt_handler(-110)
+        self.assertEqual(dev.reset_count, 2)
+        self.assertEqual(dev.wmt_retries, 2)
+
+        # Setup succeeds
+        self.assertEqual(dev.setup_wmt_handler(0), 0)
+        dev.setup_complete()
+        self.assertEqual(dev.wmt_retries, 0)
+        self.assertEqual(dev.reset_count, 2)
+
+        # Recovery is re-armed: next timeouts trigger resets up to MAX
+        for i in range(1, self.MAX_RETRIES + 1):
+            dev.setup_wmt_handler(-110)
+            self.assertEqual(dev.reset_count, 2 + i)
+            self.assertEqual(dev.wmt_retries, i)
+
+        # Stops after MAX
+        dev.setup_wmt_handler(-110)
+        self.assertEqual(dev.reset_count, 2 + self.MAX_RETRIES)
+
+    def test_wmt_exhaustion_then_success_rearms(self):
+        dev = self.BtkMtkDevice()
+        for _ in range(self.MAX_RETRIES + 2):
+            dev.setup_wmt_handler(-110)
+        self.assertEqual(dev.reset_count, self.MAX_RETRIES)
+
+        dev.setup_wmt_handler(0)
+        dev.setup_complete()
+        self.assertEqual(dev.wmt_retries, 0)
+
+        dev.setup_wmt_handler(-110)
+        self.assertEqual(dev.reset_count, self.MAX_RETRIES + 1)
+        self.assertEqual(dev.wmt_retries, 1)
+
+    def test_wmt_other_devices_do_not_reset(self):
+        dev = self.BtkMtkDevice(dev_id=0x7961)
+        ret = dev.setup_wmt_handler(-110)
+        self.assertEqual(ret, -110)
+        self.assertEqual(dev.reset_count, 0)
+        self.assertEqual(dev.wmt_retries, 0)
 
 
 class TestCUnitTests(unittest.TestCase):
