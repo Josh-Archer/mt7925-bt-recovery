@@ -1372,8 +1372,16 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 		if (err < 0) {
 			bt_dev_err(hdev, "Failed to send wmt func ctrl (%d)", err);
 
-			if (dev_id == 0x7925 && err == -ETIMEDOUT)
-				btmtk_reset_sync(hdev);
+			if (dev_id == 0x7925 && err == -ETIMEDOUT) {
+				if (btmtk_data->wmt_retries < BTMTK_WMT_MAX_RETRIES) {
+					btmtk_data->wmt_retries++;
+					btmtk_reset_sync(hdev);
+				} else {
+					bt_dev_err(hdev,
+						   "WMT func ctrl failed: max retries (%d) reached, skipping reset",
+						   BTMTK_WMT_MAX_RETRIES);
+				}
+			}
 
 			return err;
 		}
@@ -1381,6 +1389,7 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 		hci_set_msft_opcode(hdev, 0xFD30);
 		hci_set_aosp_capable(hdev);
 		btmtk_data->fw_dl_retries = 0;
+		btmtk_data->wmt_retries = 0;
 
 		/* Set up ISO interface after protocol enabled */
 		if (test_bit(BTMTK_ISOPKT_OVER_INTR, &btmtk_data->flags)) {
