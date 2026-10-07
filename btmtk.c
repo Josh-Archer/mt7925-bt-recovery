@@ -6,7 +6,13 @@
 #include <linux/firmware.h>
 #include <linux/usb.h>
 #include <linux/iopoll.h>
+#include <linux/version.h>
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 #include <linux/unaligned.h>
+#else
+#include <asm/unaligned.h>
+#endif
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
@@ -537,7 +543,11 @@ static int btmtk_usb_submit_wmt_recv_urb(struct hci_dev *hdev)
 	if (!urb)
 		return -ENOMEM;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
 	dr = kmalloc_obj(*dr);
+#else
+	dr = kmalloc(sizeof(*dr), GFP_KERNEL);
+#endif
 	if (!dr) {
 		usb_free_urb(urb);
 		return -ENOMEM;

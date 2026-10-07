@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Automated tests for MT7925 Bluetooth recovery driver (issues #2 and #3).
+Automated tests for MT7925 Bluetooth recovery driver (issues #2, #3, and #4).
 
 Validates:
 1. C retry logic compiles and runs all test cases (verifying that repeated firmware
@@ -15,10 +15,11 @@ Validates:
    - Clear log messages are issued when retry limits are reached.
    - Setup completion resets both retry counters to 0 (re-arming recovery).
    - Old single-bit test_and_set_bit retry spending is eliminated.
+   - <linux/unaligned.h> include is guarded with LINUX_VERSION_CODE for pre-6.12 kernels.
 3. Python behavioral simulation modeling bounded counters and re-arm logic for both
    firmware download failures and WMT func-ctrl timeouts.
-4. Clean compilation against installed kernel headers without loading modules
-   or touching the host's Bluetooth system.
+4. Clean compilation against installed kernel headers (and older <6.12 kernels if present)
+   without loading modules or touching the host's Bluetooth system.
 """
 
 import os
@@ -168,6 +169,28 @@ class TestSourceIntegrity(unittest.TestCase):
             self.btmtk_c,
             pattern_wmt,
             "Setup completion path must reset btmtk_data->wmt_retries to 0",
+        )
+
+    def test_unaligned_include_guarded(self):
+        """Ensure btmtk.c includes <linux/version.h> and guards unaligned.h for pre-6.12 kernels."""
+        self.assertIn(
+            "#include <linux/version.h>",
+            self.btmtk_c,
+            "btmtk.c must include <linux/version.h>",
+        )
+
+        pattern = re.compile(
+            r"#if\s+LINUX_VERSION_CODE\s*>=\s*KERNEL_VERSION\s*\(\s*6\s*,\s*12\s*,\s*0\s*\)\s*"
+            r"#\s*include\s*<linux/unaligned\.h>\s*"
+            r"#\s*else\s*"
+            r"#\s*include\s*<asm/unaligned\.h>\s*"
+            r"#\s*endif",
+            re.MULTILINE,
+        )
+        self.assertRegex(
+            self.btmtk_c,
+            pattern,
+            "btmtk.c must guard <linux/unaligned.h> with LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0) and fallback to <asm/unaligned.h>",
         )
 
 
@@ -401,6 +424,84 @@ class TestKernelModuleBuild(unittest.TestCase):
             cwd=REPO_ROOT,
         )
         self.assertEqual(clean_res.returncode, 0, f"Clean failed:\n{clean_res.stderr}")
+
+    def test_older_kernel_module_compilation(self):
+        """Verifies compile-only build against older (<6.12) kernel headers if available."""
+        import glob
+
+        candidates = set()
+        for p in glob.glob("/lib/modules/*/build"):
+            if os.path.isdir(p):
+                candidates.add(os.path.realpath(p))
+        for p in glob.glob("/usr/src/linux-headers-*"):
+            if os.path.isdir(p):
+                candidates.add(os.path.realpath(p))
+
+        older_headers = []
+        for path in sorted(candidates):
+            ver = None
+            for vh in [
+                os.path.join(path, "include", "generated", "uapi", "linux", "version.h"),
+                os.path.join(path, "include", "linux", "version.h"),
+            ]:
+                if os.path.isfile(vh):
+                    with open(vh, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            m_code = re.search(r"#define\s+LINUX_VERSION_CODE\s+(\d+)", line)
+                            if m_code:
+                                code = int(m_code.group(1))
+                                ver = ((code >> 16) & 0xFF, (code >> 8) & 0xFF, code & 0xFF)
+                                break
+                    if ver:
+                        break
+
+            if not ver:
+                name = os.path.basename(path)
+                m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", name)
+                if m:
+                    ver = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+            if ver and ver < (6, 12, 0):
+                older_headers.append((ver, path))
+
+        if not older_headers:
+            self.skipTest(
+                "No kernel headers for older kernels (<6.12) found under "
+                "/lib/modules/*/build or /usr/src/linux-headers-*"
+            )
+
+        for ver, header_dir in older_headers:
+            with self.subTest(kernel_version=ver, header_dir=header_dir):
+                build_res = subprocess.run(
+                    ["make", "-C", header_dir, f"M={REPO_ROOT}", "modules"],
+                    capture_output=True,
+                    text=True,
+                    cwd=REPO_ROOT,
+                )
+                self.assertEqual(
+                    build_res.returncode,
+                    0,
+                    f"Compile-only build failed for older kernel {ver} at {header_dir}:\n"
+                    f"STDOUT:\n{build_res.stdout}\nSTDERR:\n{build_res.stderr}",
+                )
+
+                ko_file = os.path.join(REPO_ROOT, "btmtk.ko")
+                self.assertTrue(
+                    os.path.isfile(ko_file),
+                    f"btmtk.ko was not produced for {header_dir}",
+                )
+
+                clean_res = subprocess.run(
+                    ["make", "-C", header_dir, f"M={REPO_ROOT}", "clean"],
+                    capture_output=True,
+                    text=True,
+                    cwd=REPO_ROOT,
+                )
+                self.assertEqual(
+                    clean_res.returncode,
+                    0,
+                    f"Clean failed for {header_dir}:\n{clean_res.stderr}",
+                )
 
 
 if __name__ == "__main__":
