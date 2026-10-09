@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Automated tests for MT7925 Bluetooth recovery driver (issues #2 and #3).
+Automated tests for MT7925 Bluetooth recovery driver (issues #2, #3, and #4).
 
 Validates:
 1. C retry logic compiles and runs all test cases (verifying that repeated firmware
@@ -15,10 +15,13 @@ Validates:
    - Clear log messages are issued when retry limits are reached.
    - Setup completion resets both retry counters to 0 (re-arming recovery).
    - Old single-bit test_and_set_bit retry spending is eliminated.
+   - <linux/unaligned.h> include is guarded with LINUX_VERSION_CODE for pre-6.12 kernels.
+   - Compile-time #error guard enforces Linux 6.4+ floor (devcoredump API).
+   - dkms.conf BUILD_EXCLUSIVE_KERNEL regex matches 6.4+ and rejects older kernels.
 3. Python behavioral simulation modeling bounded counters and re-arm logic for both
    firmware download failures and WMT func-ctrl timeouts.
-4. Clean compilation against installed kernel headers without loading modules
-   or touching the host's Bluetooth system.
+4. Clean compilation against installed kernel headers (and older [6.4, 6.12) kernels if present)
+   without loading modules or touching the host's Bluetooth system.
 """
 
 import os
@@ -41,6 +44,10 @@ class TestSourceIntegrity(unittest.TestCase):
         btmtk_h_path = os.path.join(REPO_ROOT, "btmtk.h")
         with open(btmtk_h_path, "r", encoding="utf-8") as f:
             cls.btmtk_h = f.read()
+
+        dkms_conf_path = os.path.join(REPO_ROOT, "dkms.conf")
+        with open(dkms_conf_path, "r", encoding="utf-8") as f:
+            cls.dkms_conf = f.read()
 
     def test_max_retries_defined_in_header(self):
         """Ensure BTMTK_FW_DL_MAX_RETRIES is defined as a bounded integer in btmtk.h."""
@@ -169,6 +176,77 @@ class TestSourceIntegrity(unittest.TestCase):
             pattern_wmt,
             "Setup completion path must reset btmtk_data->wmt_retries to 0",
         )
+
+    def test_unaligned_include_guarded(self):
+        """Ensure btmtk.c includes <linux/version.h> and guards unaligned.h for pre-6.12 kernels."""
+        self.assertIn(
+            "#include <linux/version.h>",
+            self.btmtk_c,
+            "btmtk.c must include <linux/version.h>",
+        )
+
+        pattern = re.compile(
+            r"#if\s+LINUX_VERSION_CODE\s*>=\s*KERNEL_VERSION\s*\(\s*6\s*,\s*12\s*,\s*0\s*\)\s*"
+            r"#\s*include\s*<linux/unaligned\.h>\s*"
+            r"#\s*else\s*"
+            r"#\s*include\s*<asm/unaligned\.h>\s*"
+            r"#\s*endif",
+            re.MULTILINE,
+        )
+        self.assertRegex(
+            self.btmtk_c,
+            pattern,
+            "btmtk.c must guard <linux/unaligned.h> with LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0) and fallback to <asm/unaligned.h>",
+        )
+
+    def test_min_kernel_version_error_guard(self):
+        """Ensure btmtk.c guards against kernels older than 6.4 with a compile-time #error."""
+        pattern = re.compile(
+            r"#if\s+LINUX_VERSION_CODE\s*<\s*KERNEL_VERSION\s*\(\s*6\s*,\s*4\s*,\s*0\s*\)\s*"
+            r"#\s*error\s+\"mt7925-bt-recovery requires Linux 6\.4 or newer \(Bluetooth devcoredump API\)\"\s*"
+            r"#\s*endif",
+            re.MULTILINE,
+        )
+        self.assertRegex(
+            self.btmtk_c,
+            pattern,
+            "btmtk.c must include compile-time guard for LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)",
+        )
+
+    def test_dkms_build_exclusive_kernel(self):
+        """Ensure dkms.conf defines BUILD_EXCLUSIVE_KERNEL matching 6.4+ and rejecting older kernels."""
+        match = re.search(r'BUILD_EXCLUSIVE_KERNEL=["\']([^"\']+)["\']', self.dkms_conf)
+        self.assertIsNotNone(
+            match, "BUILD_EXCLUSIVE_KERNEL must be defined in dkms.conf"
+        )
+        pattern_str = match.group(1)
+        regex = re.compile(pattern_str)
+
+        test_cases = [
+            ("6.1.0-53-amd64", False),
+            ("6.3.9", False),
+            ("6.4.0", True),
+            ("6.8.0-146-generic", True),
+            ("6.12.1", True),
+            ("6.17.0-42-generic", True),
+            ("7.0.0-38-generic", True),
+            ("10.1.0", True),
+            ("5.15.0-76-generic", False),
+            ("6.0.0", False),
+            ("6.10.0", True),
+            ("6.19.0", True),
+        ]
+
+        for ver_str, should_accept in test_cases:
+            with self.subTest(version=ver_str, should_accept=should_accept):
+                # re.search mimics bash [[ $kernelver =~ $BUILD_EXCLUSIVE_KERNEL ]]
+                matched = bool(regex.search(ver_str))
+                self.assertEqual(
+                    matched,
+                    should_accept,
+                    f"BUILD_EXCLUSIVE_KERNEL regex '{pattern_str}' "
+                    f"{'should accept' if should_accept else 'should reject'} '{ver_str}'",
+                )
 
 
 class TestBoundedRetryLogicModel(unittest.TestCase):
@@ -401,6 +479,84 @@ class TestKernelModuleBuild(unittest.TestCase):
             cwd=REPO_ROOT,
         )
         self.assertEqual(clean_res.returncode, 0, f"Clean failed:\n{clean_res.stderr}")
+
+    def test_older_kernel_module_compilation(self):
+        """Verifies compile-only build against older kernel headers in [6.4, 6.12) if available."""
+        import glob
+
+        candidates = set()
+        for p in glob.glob("/lib/modules/*/build"):
+            if os.path.isdir(p):
+                candidates.add(os.path.realpath(p))
+        for p in glob.glob("/usr/src/linux-headers-*"):
+            if os.path.isdir(p):
+                candidates.add(os.path.realpath(p))
+
+        older_headers = []
+        for path in sorted(candidates):
+            ver = None
+            for vh in [
+                os.path.join(path, "include", "generated", "uapi", "linux", "version.h"),
+                os.path.join(path, "include", "linux", "version.h"),
+            ]:
+                if os.path.isfile(vh):
+                    with open(vh, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            m_code = re.search(r"#define\s+LINUX_VERSION_CODE\s+(\d+)", line)
+                            if m_code:
+                                code = int(m_code.group(1))
+                                ver = ((code >> 16) & 0xFF, (code >> 8) & 0xFF, code & 0xFF)
+                                break
+                    if ver:
+                        break
+
+            if not ver:
+                name = os.path.basename(path)
+                m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", name)
+                if m:
+                    ver = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+            if ver and (6, 4, 0) <= ver < (6, 12, 0):
+                older_headers.append((ver, path))
+
+        if not older_headers:
+            self.skipTest(
+                "No kernel headers for older kernels in [6.4, 6.12) found under "
+                "/lib/modules/*/build or /usr/src/linux-headers-*"
+            )
+
+        for ver, header_dir in older_headers:
+            with self.subTest(kernel_version=ver, header_dir=header_dir):
+                build_res = subprocess.run(
+                    ["make", "-C", header_dir, f"M={REPO_ROOT}", "modules"],
+                    capture_output=True,
+                    text=True,
+                    cwd=REPO_ROOT,
+                )
+                self.assertEqual(
+                    build_res.returncode,
+                    0,
+                    f"Compile-only build failed for older kernel {ver} at {header_dir}:\n"
+                    f"STDOUT:\n{build_res.stdout}\nSTDERR:\n{build_res.stderr}",
+                )
+
+                ko_file = os.path.join(REPO_ROOT, "btmtk.ko")
+                self.assertTrue(
+                    os.path.isfile(ko_file),
+                    f"btmtk.ko was not produced for {header_dir}",
+                )
+
+                clean_res = subprocess.run(
+                    ["make", "-C", header_dir, f"M={REPO_ROOT}", "clean"],
+                    capture_output=True,
+                    text=True,
+                    cwd=REPO_ROOT,
+                )
+                self.assertEqual(
+                    clean_res.returncode,
+                    0,
+                    f"Clean failed for {header_dir}:\n{clean_res.stderr}",
+                )
 
 
 if __name__ == "__main__":

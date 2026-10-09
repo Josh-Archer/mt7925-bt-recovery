@@ -7,6 +7,10 @@ once.
 
 It is an out-of-tree backport for the Linux `btmtk` driver.
 
+## Requirements
+
+Linux 6.4 or newer (tested on 6.8, 6.17, 7.0).
+
 ## Install (Ubuntu/Debian)
 
 ```bash
