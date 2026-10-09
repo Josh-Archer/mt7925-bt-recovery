@@ -16,6 +16,8 @@ Validates:
    - Setup completion resets both retry counters to 0 (re-arming recovery).
    - Old single-bit test_and_set_bit retry spending is eliminated.
    - <linux/unaligned.h> include is guarded with LINUX_VERSION_CODE for pre-6.12 kernels.
+   - Preprocessor stub test proves asm/unaligned.h is selected for <6.12 and linux/unaligned.h for >=6.12.
+   - kmalloc_obj is guarded for pre-7.0 kernels.
    - Compile-time #error guard enforces Linux 6.4+ floor (devcoredump API).
    - dkms.conf BUILD_EXCLUSIVE_KERNEL regex matches 6.4+ and rejects older kernels.
 3. Python behavioral simulation modeling bounded counters and re-arm logic for both
@@ -27,6 +29,8 @@ Validates:
 import os
 import re
 import subprocess
+import tempfile
+import textwrap
 import unittest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -197,6 +201,95 @@ class TestSourceIntegrity(unittest.TestCase):
             self.btmtk_c,
             pattern,
             "btmtk.c must guard <linux/unaligned.h> with LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0) and fallback to <asm/unaligned.h>",
+        )
+
+    def test_unaligned_preprocessor_branch_selection(self):
+        """Prove the unaligned.h guard selects asm/ vs linux/ without needing older kernel headers."""
+        match = re.search(
+            r"(#if\s+LINUX_VERSION_CODE\s*>=\s*KERNEL_VERSION\s*\(\s*6\s*,\s*12\s*,\s*0\s*\)\s*"
+            r"#\s*include\s*<linux/unaligned\.h>\s*"
+            r"#\s*else\s*"
+            r"#\s*include\s*<asm/unaligned\.h>\s*"
+            r"#\s*endif)",
+            self.btmtk_c,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(match, "unaligned.h version guard block must be present in btmtk.c")
+        guard_block = match.group(1)
+
+        # KERNEL_VERSION(a,b,c) == ((a)<<16) + ((b)<<8) + (c)
+        cases = [
+            ("6.11.0", (6 << 16) + (11 << 8) + 0, "asm/unaligned.h", "linux/unaligned.h"),
+            ("6.12.0", (6 << 16) + (12 << 8) + 0, "linux/unaligned.h", "asm/unaligned.h"),
+        ]
+
+        with tempfile.TemporaryDirectory(prefix="mt7925-unaligned-") as tmp:
+            linux_dir = os.path.join(tmp, "linux")
+            asm_dir = os.path.join(tmp, "asm")
+            os.makedirs(linux_dir)
+            os.makedirs(asm_dir)
+            with open(os.path.join(linux_dir, "unaligned.h"), "w", encoding="utf-8") as f:
+                f.write("int mt7925_unaligned_stub_linux;\n")
+            with open(os.path.join(asm_dir, "unaligned.h"), "w", encoding="utf-8") as f:
+                f.write("int mt7925_unaligned_stub_asm;\n")
+
+            for label, version_code, expect_path, forbid_path in cases:
+                with self.subTest(kernel=label, expect=expect_path):
+                    src = os.path.join(tmp, f"probe_{label.replace('.', '_')}.c")
+                    with open(src, "w", encoding="utf-8") as f:
+                        f.write(
+                            textwrap.dedent(
+                                f"""\
+                                #define LINUX_VERSION_CODE {version_code}
+                                #define KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + (c))
+                                {guard_block}
+                                """
+                            )
+                        )
+                    # Keep line markers so the chosen include path appears in stdout.
+                    res = subprocess.run(
+                        ["gcc", "-E", f"-I{tmp}", src],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        res.returncode,
+                        0,
+                        f"gcc -E failed for simulated {label}:\n{res.stderr}",
+                    )
+                    self.assertIn(
+                        expect_path,
+                        res.stdout,
+                        f"Simulated {label} must expand include of <{expect_path}>",
+                    )
+                    self.assertNotIn(
+                        forbid_path,
+                        res.stdout,
+                        f"Simulated {label} must not expand include of <{forbid_path}>",
+                    )
+                    if expect_path.startswith("asm/"):
+                        self.assertIn("mt7925_unaligned_stub_asm", res.stdout)
+                        self.assertNotIn("mt7925_unaligned_stub_linux", res.stdout)
+                    else:
+                        self.assertIn("mt7925_unaligned_stub_linux", res.stdout)
+                        self.assertNotIn("mt7925_unaligned_stub_asm", res.stdout)
+
+    def test_kmalloc_obj_guarded(self):
+        """Ensure kmalloc_obj is gated for Linux 7.0+ with kmalloc fallback on older kernels."""
+        pattern = re.compile(
+            r"#if\s+LINUX_VERSION_CODE\s*>=\s*KERNEL_VERSION\s*\(\s*7\s*,\s*0\s*,\s*0\s*\)\s*"
+            r"dr\s*=\s*kmalloc_obj\s*\(\s*\*dr\s*\)\s*;\s*"
+            r"#\s*else\s*"
+            r"dr\s*=\s*kmalloc\s*\(\s*sizeof\s*\(\s*\*dr\s*\)\s*,\s*GFP_KERNEL\s*\)\s*;\s*"
+            r"#\s*endif",
+            re.MULTILINE,
+        )
+        self.assertRegex(
+            self.btmtk_c,
+            pattern,
+            "btmtk.c must guard kmalloc_obj with LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0) "
+            "and fall back to kmalloc(sizeof(*dr), GFP_KERNEL)",
         )
 
     def test_min_kernel_version_error_guard(self):
