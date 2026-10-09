@@ -8,6 +8,10 @@
 #include <linux/iopoll.h>
 #include <linux/version.h>
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+#error "mt7925-bt-recovery requires Linux 6.4 or newer (Bluetooth devcoredump API)"
+#endif
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 #include <linux/unaligned.h>
 #else
