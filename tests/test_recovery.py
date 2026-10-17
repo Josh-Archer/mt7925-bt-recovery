@@ -28,6 +28,7 @@ Validates:
    without loading modules or touching the host's Bluetooth system.
 """
 
+import gzip
 import lzma
 import os
 import re
@@ -456,8 +457,9 @@ class TestSourceIntegrity(unittest.TestCase):
     def test_dkms_uses_native_signing_without_post_build_hook(self):
         """DKMS native signing must handle the installed copy before its build hook runs."""
         self.assertNotRegex(self.dkms_conf, r'(?m)^POST_BUILD=')
-        self.assertIn("DKMS 3.x signs built modules", self.readme)
-        self.assertIn("DKMS 2.x does not provide this native signing flow", self.readme)
+        self.assertIn("DKMS 3.0.4", self.readme)
+        self.assertIn("2.8.x packages already auto-sign", self.readme)
+        self.assertIn("/etc/dkms/framework.conf.d/mt7925-bt-recovery.conf", self.readme)
 
 
 class TestBoundedRetryLogicModel(unittest.TestCase):
@@ -1002,6 +1004,34 @@ class TestModuleSigning(unittest.TestCase):
         with open(log, encoding="utf-8") as recorded:
             self.assertEqual(recorded.read().splitlines(), ["sha256", self.key, self.cert, installed])
 
+    def test_missing_dkms_module_from_distro_bluetooth_cwd_fails_without_signing(self):
+        fake_sign_file, log = self.make_fake_sign_file()
+        modules_dir = os.path.join(self.tmp, "fake-modules")
+        kernel = "6.12.0-fake"
+        distro_dir = os.path.join(modules_dir, kernel, "kernel", "drivers", "bluetooth")
+        os.makedirs(distro_dir)
+        distro_module = os.path.join(distro_dir, "btmtk.ko")
+        with open(distro_module, "wb") as f:
+            f.write(b"distro in-tree module")
+
+        env = self.env.copy()
+        env["MODULES_DIR"] = modules_dir
+        env["SIGN_TEST_LOG"] = log
+        result = subprocess.run(
+            [self.script, "--config", self.config, "sign", "--key", self.key, "--cert", self.cert,
+             "--kernel", kernel, "--sign-file", fake_sign_file],
+            capture_output=True,
+            text=True,
+            cwd=distro_dir,
+            env=env,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("btmtk.ko module not found", result.stderr)
+        with open(distro_module, "rb") as f:
+            self.assertEqual(f.read(), b"distro in-tree module")
+        self.assertFalse(os.path.exists(log), "sign-file must not run when no DKMS module is installed")
+
     def test_sign_compressed_xz_module(self):
         fake_sign_file = os.path.join(self.tmp, "sign-file-append")
         with open(fake_sign_file, "w", encoding="utf-8") as tool:
@@ -1025,6 +1055,25 @@ class TestModuleSigning(unittest.TestCase):
         with open(xz_mod, "rb") as raw_f:
             raw_bytes = raw_f.read()
         self.assertEqual(raw_bytes[7] & 0x0F, 0x01, "Recompressed module must use CRC32 check for kernel compatibility")
+
+    def test_sign_compressed_gzip_module(self):
+        fake_sign_file = os.path.join(self.tmp, "sign-file-gzip-append")
+        with open(fake_sign_file, "w", encoding="utf-8") as tool:
+            tool.write("#!/bin/sh\nprintf 'GZIP_SIGNED' >> \"$4\"\n")
+        os.chmod(fake_sign_file, 0o755)
+
+        gz_mod = os.path.join(self.tmp, "btmtk.ko.gz")
+        with gzip.GzipFile(filename=gz_mod, mode="wb", mtime=0) as f:
+            f.write(b"original gzip kernel module")
+
+        result = self.run_signer(
+            "sign", "--key", self.key, "--cert", self.cert, "--kernel", "6.12.0",
+            "--module", gz_mod, "--sign-file", fake_sign_file,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Successfully signed", result.stdout)
+        with gzip.open(gz_mod, "rb") as f:
+            self.assertEqual(f.read(), b"original gzip kernel moduleGZIP_SIGNED")
 
     def test_sign_compressed_zst_module(self):
         bin_dir = os.path.join(self.tmp, "bin-zstd")
@@ -1307,7 +1356,7 @@ class TestModuleSigning(unittest.TestCase):
                 with open(log, encoding="utf-8") as recorded:
                     self.assertEqual(recorded.read().splitlines(), ["sha256", self.key, self.cert, mod_path])
 
-    def test_module_search_signs_build_dir_module_when_uninstalled(self):
+    def test_module_search_refuses_build_dir_module_when_uninstalled(self):
         fake_sign_file, log = self.make_fake_sign_file()
         build_dir = os.path.join(self.tmp, "build-dir-test")
         os.makedirs(build_dir, exist_ok=True)
@@ -1331,10 +1380,11 @@ class TestModuleSigning(unittest.TestCase):
             env=env,
             check=False,
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Successfully signed", result.stdout)
-        with open(log, encoding="utf-8") as recorded:
-            self.assertEqual(recorded.read().splitlines(), ["sha256", self.key, self.cert, "./btmtk.ko"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("btmtk.ko module not found", result.stderr)
+        with open(local_mod, "rb") as f:
+            self.assertEqual(f.read(), b"built uninstalled module")
+        self.assertFalse(os.path.exists(log), "sign-file must not run when no DKMS module is installed")
 
 
 class TestKernelModuleBuild(unittest.TestCase):

@@ -54,24 +54,36 @@ MOK_CERT=/path/to/your/MOK.der
 # HASH_ALGO=sha256
 ```
 
-For automatic signing across kernel upgrades, DKMS 3.x signs built modules
-using its native framework configuration. Set `mok_signing_key` and
-`mok_certificate` in `/etc/dkms/framework.conf` when you want to use a custom
-key. DKMS's native signing also uses its distribution defaults when those
-settings are omitted. On Ubuntu this can be the default MOK at
+For automatic signing with a custom key across kernel upgrades, DKMS 3.0.4 or
+newer supports native framework settings. Install a drop-in rather than editing
+the package-managed `/etc/dkms/framework.conf`:
+
+```bash
+sudo install -d -m 0755 /etc/dkms/framework.conf.d
+sudo tee /etc/dkms/framework.conf.d/mt7925-bt-recovery.conf >/dev/null <<'EOF'
+mok_signing_key="/path/to/your/MOK.priv"
+mok_certificate="/path/to/your/MOK.der"
+EOF
+```
+
+DKMS's native signing also uses its distribution defaults when those settings
+are omitted. On Ubuntu this can be the default MOK at
 `/var/lib/shim-signed/mok/MOK.priv` and `MOK.der`. No project signing hook is
 needed; DKMS signs the module in its build flow before saving the copy it later
 installs. The `POST_BUILD` hook is intentionally not used because it runs
 after that saved copy is made.
 
-Automatic signing through these framework settings is supported with DKMS 3.x.
-DKMS 2.x does not provide this native signing flow; sign the installed module
-manually with this script after each DKMS build/install. The framework options
-and build hook order are documented in the [DKMS manual](https://github.com/dkms-project/dkms/blob/main/dkms.8.in).
+The native `mok_signing_key` and `mok_certificate` settings require DKMS 3.0.4
+or newer; DKMS 3.0.0–3.0.3 use the older `sign_tool` interface. Ubuntu's DKMS
+2.8.x packages already auto-sign modules with the Ubuntu MOK, so Ubuntu users
+normally do not need to configure a signing hook. On systems where DKMS does
+not provide automatic signing, sign the installed module manually with this
+script after each DKMS build/install. The framework options and build hook
+order are documented in the [DKMS manual](https://github.com/dkms-project/dkms/blob/main/dkms.8.in).
 
 The script accepts `--key` and `--cert` options as well. It targets the
 installed module under `/lib/modules/<kernel>/updates/dkms` (handling `.ko`,
-`.ko.xz`, and `.ko.zst`); pass `--kernel VERSION` and `--module PATH` to select
+`.ko.gz`, `.ko.xz`, and `.ko.zst`); pass `--kernel VERSION` and `--module PATH` to select
 a different build. Signing uses the kernel's `sign-file` utility (`kmodsign`
 is not supported). If neither signing path is configured, signing is skipped with
 a warning when Secure Boot is disabled or unknown; if Secure Boot is enabled,

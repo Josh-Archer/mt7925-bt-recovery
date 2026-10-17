@@ -23,7 +23,7 @@ Options:
   --key PATH      Path to MOK private key file (overrides MOK_KEY).
   --cert PATH     Path to MOK X.509 certificate file (overrides MOK_CERT).
   --hash ALGO     Hash algorithm for module signing: sha256, sha384, sha512 (default: sha256).
-  --module PATH   Path to btmtk.ko kernel module to sign (handles .ko, .ko.xz, .ko.zst).
+  --module PATH   Path to btmtk.ko kernel module to sign (handles .ko, .ko.gz, .ko.xz, .ko.zst).
   --kernel VER    Target kernel version (default: running kernel or $kernelver).
   --sign-file BIN Path to kernel sign-file binary (overrides auto-detection).
   --config PATH   Path to signing configuration file.
@@ -37,10 +37,11 @@ Configuration:
     1. Value of SIGN_CONF environment variable (if set)
     2. /etc/mt7925-bt-recovery/sign.conf
     3. /etc/dkms/sign.conf
-    4. /etc/dkms/framework.conf (reads mok_signing_key and mok_certificate)
+    4. /etc/dkms/framework.conf.d/*.conf and /etc/dkms/framework.conf
 
-  For automatic signing across kernel upgrades with DKMS 3.x, configure
-  mok_signing_key and mok_certificate in /etc/dkms/framework.conf.
+  For automatic signing across kernel upgrades with DKMS 3.0.4 or newer,
+  configure mok_signing_key and mok_certificate in a drop-in under
+  /etc/dkms/framework.conf.d/.
 
   Variables:
     MOK_KEY       Path to private signing key.
@@ -50,6 +51,8 @@ Configuration:
 
   Notes:
     - Signing is performed with the kernel's sign-file tool; kmodsign is not supported.
+    - Native mok_signing_key/mok_certificate settings require DKMS 3.0.4 or newer.
+    - Ubuntu's DKMS 2.8.x packages already auto-sign with the Ubuntu MOK.
 
 Behavior:
   - If Secure Boot is enabled and signing is not configured (or files are missing),
@@ -253,8 +256,12 @@ resolve_credentials() {
         local conf_candidates=(
             "/etc/mt7925-bt-recovery/sign.conf"
             "/etc/dkms/sign.conf"
-            "/etc/dkms/framework.conf"
         )
+        local dropin
+        for dropin in /etc/dkms/framework.conf.d/*.conf; do
+            [[ -f "$dropin" ]] && conf_candidates+=("$dropin")
+        done
+        conf_candidates+=("/etc/dkms/framework.conf")
         for conf in "${conf_candidates[@]}"; do
             if [[ -f "$conf" ]]; then
                 PARSED_KEY=""
@@ -348,8 +355,12 @@ resolve_credentials() {
     local conf_candidates=(
         "/etc/mt7925-bt-recovery/sign.conf"
         "/etc/dkms/sign.conf"
-        "/etc/dkms/framework.conf"
     )
+    local dropin
+    for dropin in /etc/dkms/framework.conf.d/*.conf; do
+        [[ -f "$dropin" ]] && conf_candidates+=("$dropin")
+    done
+    conf_candidates+=("/etc/dkms/framework.conf")
     for conf in "${conf_candidates[@]}"; do
         if [[ -f "$conf" ]]; then
             PARSED_KEY=""
@@ -400,7 +411,7 @@ MODULE_TARGET="${CLI_MODULE:-}"
 for arg in "${POSITIONAL_ARGS[@]}"; do
     if [[ -z "$TARGET_KERNEL" && "$arg" =~ ^[0-9]+\.[0-9]+ ]]; then
         TARGET_KERNEL="$arg"
-    elif [[ -z "$MODULE_TARGET" && "$arg" =~ \.ko(\.(xz|zst))?$ ]]; then
+    elif [[ -z "$MODULE_TARGET" && "$arg" =~ \.ko(\.(gz|xz|zst))?$ ]]; then
         MODULE_TARGET="$arg"
     fi
 done
@@ -471,12 +482,15 @@ find_module_file() {
     local mod_base="${MODULES_DIR:-/lib/modules}"
     local candidates=(
         "${mod_base}/${TARGET_KERNEL}/updates/dkms/btmtk.ko"
+        "${mod_base}/${TARGET_KERNEL}/updates/dkms/btmtk.ko.gz"
         "${mod_base}/${TARGET_KERNEL}/updates/dkms/btmtk.ko.xz"
         "${mod_base}/${TARGET_KERNEL}/updates/dkms/btmtk.ko.zst"
         "${mod_base}/${TARGET_KERNEL}/updates/btmtk.ko"
+        "${mod_base}/${TARGET_KERNEL}/updates/btmtk.ko.gz"
         "${mod_base}/${TARGET_KERNEL}/updates/btmtk.ko.xz"
         "${mod_base}/${TARGET_KERNEL}/updates/btmtk.ko.zst"
         "${mod_base}/${TARGET_KERNEL}/extra/btmtk.ko"
+        "${mod_base}/${TARGET_KERNEL}/extra/btmtk.ko.gz"
         "${mod_base}/${TARGET_KERNEL}/extra/btmtk.ko.xz"
         "${mod_base}/${TARGET_KERNEL}/extra/btmtk.ko.zst"
     )
@@ -497,22 +511,13 @@ find_module_file() {
     for ddir in "${dkms_dirs[@]}"; do
         if [[ -d "$ddir" ]]; then
             local found
-            found="$(find "$ddir" -type f \( -name "btmtk.ko" -o -name "btmtk.ko.xz" -o -name "btmtk.ko.zst" \) 2>/dev/null | head -n 1)"
+            found="$(find "$ddir" -type f \( -name "btmtk.ko" -o -name "btmtk.ko.gz" -o -name "btmtk.ko.xz" -o -name "btmtk.ko.zst" \) 2>/dev/null | head -n 1)"
             if [[ -n "$found" && -f "$found" ]]; then
                 echo "$found"
                 return 0
             fi
         fi
     done
-
-    # Fallback to local built module (e.g. for DKMS POST_BUILD hook)
-    if [[ -f "./btmtk.ko" ]]; then
-        echo "./btmtk.ko"
-        return 0
-    elif [[ -f "btmtk.ko" ]]; then
-        echo "btmtk.ko"
-        return 0
-    fi
 
     return 1
 }
@@ -549,7 +554,7 @@ sign_target_module() {
 
     echo "Signing kernel module '${mod_file}' for kernel ${TARGET_KERNEL} using ${HASH_ALGO}..."
 
-    if [[ "$mod_file" =~ \.(xz|zst)$ ]]; then
+    if [[ "$mod_file" =~ \.(gz|xz|zst)$ ]]; then
         local ext="${BASH_REMATCH[1]}"
         local tmpdir
         tmpdir="$(mktemp -d -t dkms-sign.XXXXXXXXXX)"
@@ -557,7 +562,14 @@ sign_target_module() {
         base_mod="$(basename "$mod_file" ".$ext")"
         local uncompressed="${tmpdir}/${base_mod}"
 
-        if [[ "$ext" == "xz" ]]; then
+        if [[ "$ext" == "gz" ]]; then
+            if ! command -v gzip >/dev/null 2>&1; then
+                rm -rf "$tmpdir"
+                echo "Error: 'gzip' command not found to decompress/recompress module '${mod_file}'." >&2
+                exit 1
+            fi
+            gzip -dc "$mod_file" > "$uncompressed"
+        elif [[ "$ext" == "xz" ]]; then
             if ! command -v xz >/dev/null 2>&1; then
                 rm -rf "$tmpdir"
                 echo "Error: 'xz' command not found to decompress/recompress module '${mod_file}'." >&2
@@ -582,7 +594,9 @@ sign_target_module() {
         fi
 
         local recompressed="${tmpdir}/recompressed.${ext}"
-        if [[ "$ext" == "xz" ]]; then
+        if [[ "$ext" == "gz" ]]; then
+            gzip -n -c "$uncompressed" > "$recompressed"
+        elif [[ "$ext" == "xz" ]]; then
             xz --check=crc32 -c "$uncompressed" > "$recompressed"
         elif [[ "$ext" == "zst" ]]; then
             zstd -f -q "$uncompressed" -o "$recompressed"
