@@ -2,8 +2,9 @@
 
 Some MediaTek MT7925 Bluetooth controllers time out while downloading firmware
 (`-110`), leaving no controller available after boot. We fixed it with this
-custom DKMS driver, which resets the controller and retries the failed setup
-once.
+custom DKMS driver, which resets the controller and retries the failed setup.
+MT7922 uses the same firmware-download retry. How many times to retry is the
+`fw_dl_retry_count` module parameter (default 3, range 0-10).
 
 It is an out-of-tree backport for the Linux `btmtk` driver.
 
@@ -25,3 +26,25 @@ sudo reboot
 ```
 
 With Secure Boot enabled, sign and enroll the DKMS module before rebooting.
+
+## Module parameters
+
+`fw_dl_retry_count` (unsigned integer, default 3, range 0-10)
+
+Maximum number of controller resets after a firmware-download failure on
+MT7922 (`0x7922`) and MT7925 (`0x7925`). `0` disables that reset retry.
+Values outside 0-10 are rejected at load time and when written at runtime.
+This does not change the separate WMT func-ctrl timeout retry limit.
+
+`modinfo btmtk` prints the parameter, its default, and its range. Examples:
+
+```bash
+# load time
+sudo modprobe btmtk fw_dl_retry_count=5
+
+# runtime, after the module is loaded
+echo 5 | sudo tee /sys/module/btmtk/parameters/fw_dl_retry_count
+
+# persist across boots
+echo 'options btmtk fw_dl_retry_count=5' | sudo tee /etc/modprobe.d/btmtk.conf
+```
