@@ -540,6 +540,107 @@ class TestCUnitTests(unittest.TestCase):
                 os.remove(c_test_bin)
 
 
+class TestModuleSigning(unittest.TestCase):
+    """Exercises the signing and MOK enrollment helper with temporary credentials."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script = os.path.join(REPO_ROOT, "scripts", "sign-module.sh")
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory(prefix="mt7925-signing-test-")
+        self.addCleanup(self.tempdir.cleanup)
+        self.tmp = self.tempdir.name
+        self.config = os.path.join(self.tmp, "empty.conf")
+        with open(self.config, "w", encoding="utf-8"):
+            pass
+        self.key = os.path.join(self.tmp, "mok.key")
+        self.cert = os.path.join(self.tmp, "mok.crt")
+        keygen = subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", self.key, "-out", self.cert, "-days", "1",
+                "-subj", "/CN=Temporary MT7925 signing test/",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(keygen.returncode, 0, f"Temporary test key generation failed: {keygen.stderr}")
+        self.module = os.path.join(self.tmp, "btmtk.ko")
+        with open(self.module, "wb") as module_file:
+            module_file.write(b"temporary module fixture")
+        self.env = os.environ.copy()
+        for name in ("MOK_KEY", "MOK_CERT", "MOK_SIGNING_KEY", "MOK_CERTIFICATE", "KBUILD_SIGN_KEY", "KBUILD_SIGN_PIN", "SIGN_CONF", "HASH_ALGO", "SIGN_FILE", "kernelver"):
+            self.env.pop(name, None)
+
+    def run_signer(self, *args, env=None):
+        return subprocess.run(
+            [self.script, "--config", self.config, *args],
+            capture_output=True,
+            text=True,
+            env=env or self.env,
+            check=False,
+        )
+
+    def test_signing_skips_with_warning_when_not_configured(self):
+        result = self.run_signer("sign", "--kernel", "6.12.0", "--module", self.module)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Secure Boot signing is not configured", result.stderr)
+        self.assertIn("Skipping module signing", result.stderr)
+
+    def test_configured_signing_calls_kernel_sign_file(self):
+        log = os.path.join(self.tmp, "sign-file-args")
+        fake_sign_file = os.path.join(self.tmp, "sign-file")
+        with open(fake_sign_file, "w", encoding="utf-8") as tool:
+            tool.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SIGN_TEST_LOG\"\n")
+        os.chmod(fake_sign_file, 0o755)
+        env = self.env.copy()
+        env["SIGN_TEST_LOG"] = log
+        result = self.run_signer(
+            "sign", "--key", self.key, "--cert", self.cert, "--kernel", "6.12.0",
+            "--module", self.module, "--sign-file", fake_sign_file, env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Successfully signed", result.stdout)
+        with open(log, encoding="utf-8") as recorded:
+            self.assertEqual(recorded.read().splitlines(), ["sha256", self.key, self.cert, self.module])
+
+    def test_incomplete_signing_configuration_fails_clearly(self):
+        result = self.run_signer("sign", "--cert", self.cert)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MOK_KEY is missing", result.stderr)
+
+    def test_missing_configured_key_fails_clearly(self):
+        missing_key = os.path.join(self.tmp, "missing.key")
+        result = self.run_signer("sign", "--key", missing_key, "--cert", self.cert)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MOK private key file not found", result.stderr)
+
+    def test_enroll_submits_certificate_to_mokutil(self):
+        bin_dir = os.path.join(self.tmp, "bin")
+        os.makedirs(bin_dir)
+        log = os.path.join(self.tmp, "mokutil-args")
+        cert_copy = os.path.join(self.tmp, "mokutil-cert.der")
+        mock_mokutil = os.path.join(bin_dir, "mokutil")
+        with open(mock_mokutil, "w", encoding="utf-8") as tool:
+            tool.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$MOK_TEST_LOG\"\ncp \"$2\" \"$MOK_TEST_COPY\"\n")
+        os.chmod(mock_mokutil, 0o755)
+        env = self.env.copy()
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        env["MOK_TEST_LOG"] = log
+        env["MOK_TEST_COPY"] = cert_copy
+        result = self.run_signer("enroll", "--cert", self.cert, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("MOK certificate staged for enrollment", result.stdout)
+        with open(log, encoding="utf-8") as recorded:
+            args = recorded.read().splitlines()
+        self.assertEqual(args[0], "--import")
+        self.assertTrue(args[1].endswith(".der"))
+        self.assertTrue(os.path.isfile(cert_copy))
+        self.assertGreater(os.path.getsize(cert_copy), 0)
+
+
 class TestKernelModuleBuild(unittest.TestCase):
     """Verifies that the out-of-tree module builds cleanly against current kernel headers."""
 
