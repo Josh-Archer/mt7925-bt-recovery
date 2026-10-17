@@ -23,7 +23,7 @@
 
 #include "btmtk.h"
 
-#define VERSION "0.1"
+#define VERSION "0.2.0"
 
 /* Time to wait for the vendor event of each WMT command. The stock value is
  * HCI_INIT_TIMEOUT (10 s); a stalled firmware download burns all of it before

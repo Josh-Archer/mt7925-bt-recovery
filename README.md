@@ -17,10 +17,10 @@ Linux 6.4 or newer (tested on 6.8, 6.17, 7.0).
 sudo apt install dkms git linux-headers-$(uname -r)
 git clone https://github.com/Josh-Archer/mt7925-bt-recovery.git
 cd mt7925-bt-recovery
-sudo install -d /usr/src/mt7925-bt-recovery-0.1
-sudo install -m 0644 Makefile dkms.conf btmtk.c btmtk.h /usr/src/mt7925-bt-recovery-0.1/
-sudo dkms add -m mt7925-bt-recovery -v 0.1
-sudo dkms install -m mt7925-bt-recovery -v 0.1
+sudo install -d /usr/src/mt7925-bt-recovery-0.2.0
+sudo install -m 0644 Makefile dkms.conf btmtk.c btmtk.h /usr/src/mt7925-bt-recovery-0.2.0/
+sudo dkms add -m mt7925-bt-recovery -v 0.2.0
+sudo dkms install -m mt7925-bt-recovery -v 0.2.0
 sudo reboot
 ```
 
