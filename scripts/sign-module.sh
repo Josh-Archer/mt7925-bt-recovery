@@ -479,9 +479,6 @@ find_module_file() {
         "${mod_base}/${TARGET_KERNEL}/extra/btmtk.ko"
         "${mod_base}/${TARGET_KERNEL}/extra/btmtk.ko.xz"
         "${mod_base}/${TARGET_KERNEL}/extra/btmtk.ko.zst"
-        "${mod_base}/${TARGET_KERNEL}/kernel/drivers/bluetooth/btmtk.ko"
-        "${mod_base}/${TARGET_KERNEL}/kernel/drivers/bluetooth/btmtk.ko.xz"
-        "${mod_base}/${TARGET_KERNEL}/kernel/drivers/bluetooth/btmtk.ko.zst"
     )
 
     for cand in "${candidates[@]}"; do
@@ -491,14 +488,30 @@ find_module_file() {
         fi
     done
 
-    # Fallback search in ${mod_base}/${TARGET_KERNEL}
-    if [[ -d "${mod_base}/${TARGET_KERNEL}" ]]; then
-        local found
-        found="$(find "${mod_base}/${TARGET_KERNEL}" -name "btmtk.ko*" 2>/dev/null | head -n 1)"
-        if [[ -n "$found" && -f "$found" ]]; then
-            echo "$found"
-            return 0
+    # Fallback search restricted to DKMS locations with exact module names
+    local dkms_dirs=(
+        "${mod_base}/${TARGET_KERNEL}/updates/dkms"
+        "${mod_base}/${TARGET_KERNEL}/updates"
+        "${mod_base}/${TARGET_KERNEL}/extra"
+    )
+    for ddir in "${dkms_dirs[@]}"; do
+        if [[ -d "$ddir" ]]; then
+            local found
+            found="$(find "$ddir" -type f \( -name "btmtk.ko" -o -name "btmtk.ko.xz" -o -name "btmtk.ko.zst" \) 2>/dev/null | head -n 1)"
+            if [[ -n "$found" && -f "$found" ]]; then
+                echo "$found"
+                return 0
+            fi
         fi
+    done
+
+    # Fallback to local built module (e.g. for DKMS POST_BUILD hook)
+    if [[ -f "./btmtk.ko" ]]; then
+        echo "./btmtk.ko"
+        return 0
+    elif [[ -f "btmtk.ko" ]]; then
+        echo "btmtk.ko"
+        return 0
     fi
 
     return 1
@@ -560,8 +573,9 @@ sign_target_module() {
             zstd -d -q -c "$mod_file" > "$uncompressed"
         fi
 
-        if ! "$sign_bin" "$HASH_ALGO" "$KEY_FILE" "$CERT_FILE" "$uncompressed"; then
-            local status=$?
+        local status=0
+        "$sign_bin" "$HASH_ALGO" "$KEY_FILE" "$CERT_FILE" "$uncompressed" || status=$?
+        if [[ "$status" -ne 0 ]]; then
             rm -rf "$tmpdir"
             echo "Error: Failed to sign ${mod_file} with sign-file (exit code ${status})." >&2
             exit "$status"
@@ -569,7 +583,7 @@ sign_target_module() {
 
         local recompressed="${tmpdir}/recompressed.${ext}"
         if [[ "$ext" == "xz" ]]; then
-            xz -c "$uncompressed" > "$recompressed"
+            xz --check=crc32 -c "$uncompressed" > "$recompressed"
         elif [[ "$ext" == "zst" ]]; then
             zstd -f -q "$uncompressed" -o "$recompressed"
         fi
@@ -579,8 +593,9 @@ sign_target_module() {
         mv -f "$recompressed" "$mod_file"
         rm -rf "$tmpdir"
     else
-        if ! "$sign_bin" "$HASH_ALGO" "$KEY_FILE" "$CERT_FILE" "$mod_file"; then
-            local status=$?
+        local status=0
+        "$sign_bin" "$HASH_ALGO" "$KEY_FILE" "$CERT_FILE" "$mod_file" || status=$?
+        if [[ "$status" -ne 0 ]]; then
             echo "Error: Failed to sign ${mod_file} with sign-file (exit code ${status})." >&2
             exit "$status"
         fi
@@ -659,8 +674,10 @@ do_sign() {
     # Locate sign-file binary
     local sign_bin
     if ! sign_bin="$(find_sign_file)"; then
-        echo "Error: Kernel 'sign-file' tool not found for kernel ${TARGET_KERNEL}." >&2
-        echo "Please install linux-headers-${TARGET_KERNEL} or specify tool with --sign-file." >&2
+        if [[ -z "$SIGN_FILE_BIN" ]]; then
+            echo "Error: Kernel 'sign-file' tool not found for kernel ${TARGET_KERNEL}." >&2
+            echo "Please install linux-headers-${TARGET_KERNEL} or specify tool with --sign-file." >&2
+        fi
         exit 1
     fi
 
@@ -706,7 +723,9 @@ do_enroll() {
     trap cleanup EXIT
 
     echo "Enrolling MOK certificate '$CERT_FILE' into UEFI MOK database..."
-    if mokutil --import "$enroll_cert"; then
+    local status=0
+    mokutil --import "$enroll_cert" || status=$?
+    if [[ "$status" -eq 0 ]]; then
         cat <<'EOF'
 
 MOK certificate staged for enrollment.
@@ -718,7 +737,6 @@ Next steps to complete Secure Boot activation:
   5. Select 'Reboot' to boot with your signed module trusted by UEFI.
 EOF
     else
-        local status=$?
         echo "Error: mokutil --import failed with exit code ${status}." >&2
         exit "$status"
     fi

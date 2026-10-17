@@ -342,6 +342,13 @@ class TestSourceIntegrity(unittest.TestCase):
                     f"{'should accept' if should_accept else 'should reject'} '{ver_str}'",
                 )
 
+    def test_dkms_post_build_hook(self):
+        """Ensure dkms.conf defines POST_BUILD hook running scripts/sign-module.sh."""
+        match = re.search(r'POST_BUILD=["\']([^"\']+)["\']', self.dkms_conf)
+        self.assertIsNotNone(match, "POST_BUILD must be defined in dkms.conf")
+        post_build = match.group(1)
+        self.assertEqual(post_build, "scripts/sign-module.sh")
+
 
 class TestBoundedRetryLogicModel(unittest.TestCase):
     """Python behavioral simulation of the bounded retry logic."""
@@ -778,6 +785,9 @@ class TestModuleSigning(unittest.TestCase):
         with lzma.open(xz_mod, "rb") as f:
             content = f.read()
         self.assertEqual(content, b"original raw kernel moduleSIGNED_MARKER")
+        with open(xz_mod, "rb") as raw_f:
+            raw_bytes = raw_f.read()
+        self.assertEqual(raw_bytes[7] & 0x0F, 0x01, "Recompressed module must use CRC32 check for kernel compatibility")
 
     def test_sign_compressed_zst_module(self):
         bin_dir = os.path.join(self.tmp, "bin-zstd")
@@ -881,6 +891,8 @@ class TestModuleSigning(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Configured sign-file binary is not executable", result.stderr)
+        self.assertNotIn("Kernel 'sign-file' tool not found", result.stderr)
+        self.assertNotIn("Please install linux-headers", result.stderr)
 
     def test_require_consistent_credential_source(self):
         env = self.env.copy()
@@ -924,6 +936,168 @@ class TestModuleSigning(unittest.TestCase):
         self.assertTrue(args[1].endswith(".der"))
         self.assertTrue(os.path.isfile(cert_copy))
         self.assertGreater(os.path.getsize(cert_copy), 0)
+
+    def test_sign_file_failure_returns_nonzero_exit_status(self):
+        fake_sign_file = os.path.join(self.tmp, "sign-file-fail")
+        with open(fake_sign_file, "w", encoding="utf-8") as tool:
+            tool.write("#!/bin/sh\nexit 3\n")
+        os.chmod(fake_sign_file, 0o755)
+
+        result = self.run_signer(
+            "sign", "--key", self.key, "--cert", self.cert, "--kernel", "6.12.0",
+            "--module", self.module, "--sign-file", fake_sign_file,
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("Error: Failed to sign", result.stderr)
+        self.assertIn("exit code 3", result.stderr)
+
+    def test_sign_file_failure_compressed_module_returns_nonzero_exit_status(self):
+        fake_sign_file = os.path.join(self.tmp, "sign-file-fail-comp")
+        with open(fake_sign_file, "w", encoding="utf-8") as tool:
+            tool.write("#!/bin/sh\nexit 7\n")
+        os.chmod(fake_sign_file, 0o755)
+
+        xz_mod = os.path.join(self.tmp, "btmtk_fail.ko.xz")
+        with lzma.open(xz_mod, "wb") as f:
+            f.write(b"raw module")
+
+        result = self.run_signer(
+            "sign", "--key", self.key, "--cert", self.cert, "--kernel", "6.12.0",
+            "--module", xz_mod, "--sign-file", fake_sign_file,
+        )
+        self.assertEqual(result.returncode, 7)
+        self.assertIn("Error: Failed to sign", result.stderr)
+        self.assertIn("exit code 7", result.stderr)
+
+    def test_mokutil_enroll_failure_returns_nonzero_exit_status(self):
+        bin_dir = os.path.join(self.tmp, "bin-mok-fail")
+        os.makedirs(bin_dir)
+        mock_mokutil = os.path.join(bin_dir, "mokutil")
+        with open(mock_mokutil, "w", encoding="utf-8") as tool:
+            tool.write("#!/bin/sh\nexit 4\n")
+        os.chmod(mock_mokutil, 0o755)
+        env = self.env.copy()
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        result = self.run_signer("enroll", "--cert", self.cert, env=env)
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("Error: mokutil --import failed with exit code 4", result.stderr)
+
+    def test_never_signs_distro_kernel_module_when_dkms_module_missing(self):
+        fake_sign_file, log = self.make_fake_sign_file()
+        modules_dir = os.path.join(self.tmp, "distro-only", "lib", "modules")
+        distro_mod = os.path.join(modules_dir, "6.12.0", "kernel", "drivers", "bluetooth", "btmtk.ko")
+        os.makedirs(os.path.dirname(distro_mod), exist_ok=True)
+        with open(distro_mod, "wb") as f:
+            f.write(b"distro in-tree module")
+
+        env = self.env.copy()
+        env["MODULES_DIR"] = modules_dir
+        env["SIGN_TEST_LOG"] = log
+        scratch_cwd = os.path.join(self.tmp, "distro-only", "scratch")
+        os.makedirs(scratch_cwd, exist_ok=True)
+
+        result = subprocess.run(
+            [self.script, "--config", self.config, "sign", "--key", self.key, "--cert", self.cert,
+             "--kernel", "6.12.0", "--sign-file", fake_sign_file],
+            capture_output=True,
+            text=True,
+            cwd=scratch_cwd,
+            env=env,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("btmtk.ko module not found for kernel 6.12.0", result.stderr)
+        self.assertFalse(os.path.exists(log), "Distro module must not be signed")
+        with open(distro_mod, "rb") as f:
+            self.assertEqual(f.read(), b"distro in-tree module")
+
+    def test_fallback_search_rejects_bak_and_non_module_suffixes(self):
+        fake_sign_file, log = self.make_fake_sign_file()
+        modules_dir = os.path.join(self.tmp, "bak-only", "lib", "modules")
+        bak_file = os.path.join(modules_dir, "6.12.0", "updates", "dkms", "btmtk.ko.bak")
+        os.makedirs(os.path.dirname(bak_file), exist_ok=True)
+        with open(bak_file, "wb") as f:
+            f.write(b"backup module")
+
+        env = self.env.copy()
+        env["MODULES_DIR"] = modules_dir
+        env["SIGN_TEST_LOG"] = log
+        scratch_cwd = os.path.join(self.tmp, "bak-only", "scratch")
+        os.makedirs(scratch_cwd, exist_ok=True)
+
+        result = subprocess.run(
+            [self.script, "--config", self.config, "sign", "--key", self.key, "--cert", self.cert,
+             "--kernel", "6.12.0", "--sign-file", fake_sign_file],
+            capture_output=True,
+            text=True,
+            cwd=scratch_cwd,
+            env=env,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("btmtk.ko module not found for kernel 6.12.0", result.stderr)
+        self.assertFalse(os.path.exists(log), ".bak file must not be signed")
+        with open(bak_file, "rb") as f:
+            self.assertEqual(f.read(), b"backup module")
+
+    def test_module_search_finds_dkms_destinations(self):
+        fake_sign_file, log = self.make_fake_sign_file()
+        for subdir in ("updates", "extra"):
+            with self.subTest(subdir=subdir):
+                modules_dir = os.path.join(self.tmp, f"dkms-{subdir}", "lib", "modules")
+                mod_path = os.path.join(modules_dir, "6.12.0", subdir, "btmtk.ko")
+                os.makedirs(os.path.dirname(mod_path), exist_ok=True)
+                with open(mod_path, "wb") as f:
+                    f.write(b"dkms module")
+
+                env = self.env.copy()
+                env["MODULES_DIR"] = modules_dir
+                env["SIGN_TEST_LOG"] = log
+                scratch_cwd = os.path.join(self.tmp, f"dkms-{subdir}", "scratch")
+                os.makedirs(scratch_cwd, exist_ok=True)
+
+                result = subprocess.run(
+                    [self.script, "--config", self.config, "sign", "--key", self.key, "--cert", self.cert,
+                     "--kernel", "6.12.0", "--sign-file", fake_sign_file],
+                    capture_output=True,
+                    text=True,
+                    cwd=scratch_cwd,
+                    env=env,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Successfully signed", result.stdout)
+                with open(log, encoding="utf-8") as recorded:
+                    self.assertEqual(recorded.read().splitlines(), ["sha256", self.key, self.cert, mod_path])
+
+    def test_module_search_signs_build_dir_module_when_uninstalled(self):
+        fake_sign_file, log = self.make_fake_sign_file()
+        build_dir = os.path.join(self.tmp, "build-dir-test")
+        os.makedirs(build_dir, exist_ok=True)
+        local_mod = os.path.join(build_dir, "btmtk.ko")
+        with open(local_mod, "wb") as f:
+            f.write(b"built uninstalled module")
+
+        empty_modules_dir = os.path.join(self.tmp, "empty-modules", "lib", "modules")
+        os.makedirs(empty_modules_dir, exist_ok=True)
+
+        env = self.env.copy()
+        env["MODULES_DIR"] = empty_modules_dir
+        env["SIGN_TEST_LOG"] = log
+
+        result = subprocess.run(
+            [self.script, "--config", self.config, "sign", "--key", self.key, "--cert", self.cert,
+             "--kernel", "6.12.0", "--sign-file", fake_sign_file],
+            capture_output=True,
+            text=True,
+            cwd=build_dir,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Successfully signed", result.stdout)
+        with open(log, encoding="utf-8") as recorded:
+            self.assertEqual(recorded.read().splitlines(), ["sha256", self.key, self.cert, "./btmtk.ko"])
 
 
 class TestKernelModuleBuild(unittest.TestCase):

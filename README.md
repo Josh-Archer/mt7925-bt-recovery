@@ -53,10 +53,10 @@ MOK_CERT=/path/to/your/MOK.der
 # HASH_ALGO=sha256
 ```
 
-For automatic signing across kernel upgrades on DKMS 3.x, configure
+For automatic signing across kernel upgrades, a `POST_BUILD` hook is configured
+in `dkms.conf` to run `scripts/sign-module.sh`. On DKMS 3.x, you can also configure
 `mok_signing_key` and `mok_certificate` in `/etc/dkms/framework.conf`
-(`sign_tool` was dropped in DKMS 3.x). Older DKMS setups can invoke
-`scripts/sign-module.sh` (or `sign_tool`).
+(`sign_tool` was dropped in DKMS 3.x).
 
 The script accepts `--key` and `--cert` options as well. It targets the
 installed module under `/lib/modules/<kernel>/updates/dkms` (handling `.ko`,
