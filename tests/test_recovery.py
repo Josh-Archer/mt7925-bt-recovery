@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Automated tests for MT7925 Bluetooth recovery driver (issues #2, #3, and #4).
+Automated tests for MT7925/MT7922 Bluetooth recovery driver (issues #2, #3, #4, #5, and #6).
 
 Validates:
 1. C retry logic compiles and runs all test cases (verifying that repeated firmware
    download failures and WMT timeouts reset at most MAX times, then stop, and successful
-   setup re-arms).
+   setup re-arms). Firmware-download retries follow fw_dl_retry_count, including
+   non-default values inside the documented bounds.
 2. Source-level checks on btmtk.c and btmtk.h to verify that:
-   - BTMTK_FW_DL_MAX_RETRIES and BTMTK_WMT_MAX_RETRIES are defined in btmtk.h.
+   - BTMTK_FW_DL_RETRY_DEFAULT/MIN/MAX and BTMTK_WMT_MAX_RETRIES are defined in btmtk.h.
+   - fw_dl_retry_count is a module parameter with those bounds, documented for modinfo.
    - fw_dl_retries and wmt_retries counters are defined in struct btmtk_data.
-   - Firmware download failure path bounds reset attempts by BTMTK_FW_DL_MAX_RETRIES.
+   - Firmware download failure path bounds reset attempts by fw_dl_retry_count.
    - WMT func-ctrl timeout path bounds reset attempts by BTMTK_WMT_MAX_RETRIES.
    - Counters are incremented only when a reset is requested.
    - Clear log messages are issued when retry limits are reached.
@@ -36,6 +38,32 @@ import unittest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
+# Contract for the fw_dl_retry_count module parameter (issue #5).
+FW_DL_RETRY_DEFAULT = 3
+FW_DL_RETRY_MIN = 0
+FW_DL_RETRY_MAX = 10
+FW_DL_RETRY_PARM_DESC = (
+    "Firmware download reset retries for MT7922 and MT7925 "
+    "(default 3, range 0-10)"
+)
+
+
+def set_fw_dl_retry_count(current, text):
+    """Host model of param_set_uint_minmax for fw_dl_retry_count.
+
+    Matches kstrtouint base 0, including one trailing newline, and leaves
+    current unchanged when the text is not an in-range unsigned integer.
+    """
+    if not isinstance(text, str):
+        return current
+    parsed = text[:-1] if text.endswith("\n") else text
+    if not re.fullmatch(r"(0x[0-9A-Fa-f]+|0[0-7]*|[1-9][0-9]*)", parsed):
+        return current
+    value = int(parsed, 0)
+    if value > 0xFFFFFFFF or value < FW_DL_RETRY_MIN or value > FW_DL_RETRY_MAX:
+        return current
+    return value
+
 
 class TestSourceIntegrity(unittest.TestCase):
     """Verifies btmtk.c and btmtk.h source implementation matches bounded recovery requirements."""
@@ -54,11 +82,27 @@ class TestSourceIntegrity(unittest.TestCase):
         with open(dkms_conf_path, "r", encoding="utf-8") as f:
             cls.dkms_conf = f.read()
 
-    def test_max_retries_defined_in_header(self):
-        """Ensure BTMTK_FW_DL_MAX_RETRIES is defined as a bounded integer in btmtk.h."""
-        match = re.search(r"#define\s+BTMTK_FW_DL_MAX_RETRIES\s+(\d+)", self.btmtk_h)
-        self.assertIsNotNone(match, "BTMTK_FW_DL_MAX_RETRIES must be defined in btmtk.h")
-        self.assertEqual(int(match.group(1)), 3, "BTMTK_FW_DL_MAX_RETRIES should be 3")
+        readme_path = os.path.join(REPO_ROOT, "README.md")
+        with open(readme_path, "r", encoding="utf-8") as f:
+            cls.readme = f.read()
+
+    def test_fw_dl_retry_bounds_defined_in_header(self):
+        """Ensure firmware-download retry default and bounds are defined in btmtk.h."""
+        expected = {
+            "BTMTK_FW_DL_RETRY_DEFAULT": FW_DL_RETRY_DEFAULT,
+            "BTMTK_FW_DL_RETRY_MIN": FW_DL_RETRY_MIN,
+            "BTMTK_FW_DL_RETRY_MAX": FW_DL_RETRY_MAX,
+        }
+        for name, value in expected.items():
+            with self.subTest(name=name):
+                match = re.search(rf"#define\s+{name}\s+(\d+)", self.btmtk_h)
+                self.assertIsNotNone(match, f"{name} must be defined in btmtk.h")
+                self.assertEqual(int(match.group(1)), value)
+        self.assertNotIn(
+            "BTMTK_FW_DL_MAX_RETRIES",
+            self.btmtk_h,
+            "Fixed BTMTK_FW_DL_MAX_RETRIES cap must be replaced by the module parameter bounds",
+        )
 
     def test_wmt_max_retries_defined_in_header(self):
         """Ensure BTMTK_WMT_MAX_RETRIES is defined as a bounded integer in btmtk.h."""
@@ -105,15 +149,82 @@ class TestSourceIntegrity(unittest.TestCase):
         )
 
     def test_fw_failure_bounded_reset(self):
-        """Ensure MT7925 firmware download failure checks retry limit before reset."""
+        """Ensure MT7925 and MT7922 firmware download failure checks retry limit before reset."""
         pattern = re.compile(
-            r"if\s*\(\s*dev_id\s*==\s*0x7925\s*\)\s*\{[^}]*fw_dl_retries\s*<\s*BTMTK_FW_DL_MAX_RETRIES[^}]*btmtk_reset_sync\s*\(\s*hdev\s*\)\s*;",
+            r"if\s*\(\s*(?:dev_id\s*==\s*0x7925\s*\|\|\s*dev_id\s*==\s*0x7922|dev_id\s*==\s*0x7922\s*\|\|\s*dev_id\s*==\s*0x7925)\s*\)\s*\{[^}]*fw_dl_retries\s*<\s*fw_dl_retry_count[^}]*btmtk_reset_sync\s*\(\s*hdev\s*\)\s*;",
             re.DOTALL,
         )
         self.assertRegex(
             self.btmtk_c,
             pattern,
-            "MT7925 failure path must guard btmtk_reset_sync with fw_dl_retries < BTMTK_FW_DL_MAX_RETRIES",
+            "MT7925/MT7922 failure path must guard btmtk_reset_sync with fw_dl_retries < fw_dl_retry_count",
+        )
+        self.assertNotIn(
+            "BTMTK_FW_DL_MAX_RETRIES",
+            self.btmtk_c,
+            "Firmware download retry path must use fw_dl_retry_count, not a fixed macro",
+        )
+
+    def test_fw_dl_retry_count_module_param(self):
+        """Ensure fw_dl_retry_count is a bounded module parameter documented for modinfo."""
+        self.assertRegex(
+            self.btmtk_c,
+            re.compile(
+                r"static\s+unsigned\s+int\s+fw_dl_retry_count\s*=\s*BTMTK_FW_DL_RETRY_DEFAULT\s*;"
+            ),
+            "fw_dl_retry_count must default to BTMTK_FW_DL_RETRY_DEFAULT",
+        )
+        self.assertRegex(
+            self.btmtk_c,
+            re.compile(
+                r"param_set_uint_minmax\s*\(\s*val\s*,\s*kp\s*,\s*"
+                r"BTMTK_FW_DL_RETRY_MIN\s*,\s*BTMTK_FW_DL_RETRY_MAX\s*\)"
+            ),
+            "Setter must reject values outside BTMTK_FW_DL_RETRY_MIN..MAX",
+        )
+        self.assertRegex(
+            self.btmtk_c,
+            re.compile(
+                r"module_param_cb\s*\(\s*fw_dl_retry_count\s*,\s*"
+                r"&btmtk_fw_dl_retry_count_ops\s*,\s*&fw_dl_retry_count\s*,\s*0644\s*\)"
+            ),
+            "fw_dl_retry_count must be registered with module_param_cb",
+        )
+        self.assertRegex(
+            self.btmtk_c,
+            re.compile(r"__MODULE_PARM_TYPE\s*\(\s*fw_dl_retry_count\s*,\s*\"uint\"\s*\)"),
+            "modinfo must report fw_dl_retry_count as uint",
+        )
+        desc = re.search(
+            r"MODULE_PARM_DESC\s*\(\s*fw_dl_retry_count\s*,\s*\"([^\"]+)\"\s*\)",
+            self.btmtk_c,
+        )
+        self.assertIsNotNone(desc, "MODULE_PARM_DESC(fw_dl_retry_count, ...) is required for modinfo")
+        self.assertEqual(desc.group(1), FW_DL_RETRY_PARM_DESC)
+
+    def test_readme_documents_fw_dl_retry_param(self):
+        """Ensure the README documents the parameter name, default, bounds, and modinfo."""
+        self.assertIn("fw_dl_retry_count", self.readme)
+        self.assertIn("modinfo", self.readme)
+        self.assertIn(str(FW_DL_RETRY_DEFAULT), self.readme)
+        self.assertRegex(
+            self.readme,
+            rf"{FW_DL_RETRY_MIN}\s*-\s*{FW_DL_RETRY_MAX}",
+        )
+        self.assertIn("/sys/module/btmtk/parameters/fw_dl_retry_count", self.readme)
+        self.assertIn("MT7922", self.readme)
+        self.assertIn("MT7925", self.readme)
+
+    def test_mt7922_included_in_fw_retry(self):
+        """Ensure MT7922 (0x7922) is included in firmware download recovery."""
+        pattern = re.compile(
+            r"if\s*\([^)]*0x7922[^)]*\)\s*\{[^}]*fw_dl_retries\s*<\s*fw_dl_retry_count",
+            re.DOTALL,
+        )
+        self.assertRegex(
+            self.btmtk_c,
+            pattern,
+            "btmtk.c must include MT7922 (0x7922) in firmware download retry logic",
         )
 
     def test_fw_failure_increments_counter(self):
@@ -342,12 +453,11 @@ class TestSourceIntegrity(unittest.TestCase):
                     f"{'should accept' if should_accept else 'should reject'} '{ver_str}'",
                 )
 
-    def test_dkms_post_build_hook(self):
-        """Ensure dkms.conf defines POST_BUILD hook running scripts/sign-module.sh."""
-        match = re.search(r'POST_BUILD=["\']([^"\']+)["\']', self.dkms_conf)
-        self.assertIsNotNone(match, "POST_BUILD must be defined in dkms.conf")
-        post_build = match.group(1)
-        self.assertEqual(post_build, "scripts/sign-module.sh")
+    def test_dkms_uses_native_signing_without_post_build_hook(self):
+        """DKMS native signing must handle the installed copy before its build hook runs."""
+        self.assertNotRegex(self.dkms_conf, r'(?m)^POST_BUILD=')
+        self.assertIn("DKMS 3.x signs built modules", self.readme)
+        self.assertIn("DKMS 2.x does not provide this native signing flow", self.readme)
 
 
 class TestBoundedRetryLogicModel(unittest.TestCase):
@@ -356,16 +466,17 @@ class TestBoundedRetryLogicModel(unittest.TestCase):
     MAX_RETRIES = 3
 
     class BtkMtkDevice:
-        def __init__(self, dev_id=0x7925):
+        def __init__(self, dev_id=0x7925, fw_dl_retry_count=FW_DL_RETRY_DEFAULT):
             self.dev_id = dev_id
+            self.fw_dl_retry_count = fw_dl_retry_count
             self.fw_dl_retries = 0
             self.wmt_retries = 0
             self.reset_count = 0
 
         def setup_fw_handler(self, fw_err):
             if fw_err < 0:
-                if self.dev_id == 0x7925:
-                    if self.fw_dl_retries < TestBoundedRetryLogicModel.MAX_RETRIES:
+                if self.dev_id in (0x7925, 0x7922):
+                    if self.fw_dl_retries < self.fw_dl_retry_count:
                         self.fw_dl_retries += 1
                         self.reset_count += 1
                     else:
@@ -448,6 +559,59 @@ class TestBoundedRetryLogicModel(unittest.TestCase):
         self.assertEqual(dev.reset_count, 0)
         self.assertEqual(dev.fw_dl_retries, 0)
 
+    def test_mt7922_repeated_failures_bounded_at_max(self):
+        dev = self.BtkMtkDevice(dev_id=0x7922)
+        for i in range(1, self.MAX_RETRIES + 1):
+            ret = dev.setup_fw_handler(-110)
+            self.assertEqual(ret, -110)
+            self.assertEqual(dev.reset_count, i)
+            self.assertEqual(dev.fw_dl_retries, i)
+
+        # Additional failures after reaching max do not trigger further resets
+        for _ in range(5):
+            ret = dev.setup_fw_handler(-110)
+            self.assertEqual(ret, -110)
+            self.assertEqual(dev.reset_count, self.MAX_RETRIES)
+            self.assertEqual(dev.fw_dl_retries, self.MAX_RETRIES)
+
+    def test_mt7922_setup_success_rearms_recovery(self):
+        dev = self.BtkMtkDevice(dev_id=0x7922)
+        # Fail twice
+        dev.setup_fw_handler(-110)
+        dev.setup_fw_handler(-110)
+        self.assertEqual(dev.reset_count, 2)
+        self.assertEqual(dev.fw_dl_retries, 2)
+
+        # Setup succeeds
+        self.assertEqual(dev.setup_fw_handler(0), 0)
+        dev.setup_complete()
+        self.assertEqual(dev.fw_dl_retries, 0)
+        self.assertEqual(dev.reset_count, 2)
+
+        # Recovery is re-armed: next failures trigger resets up to MAX
+        for i in range(1, self.MAX_RETRIES + 1):
+            dev.setup_fw_handler(-110)
+            self.assertEqual(dev.reset_count, 2 + i)
+            self.assertEqual(dev.fw_dl_retries, i)
+
+        # Stops after MAX
+        dev.setup_fw_handler(-110)
+        self.assertEqual(dev.reset_count, 2 + self.MAX_RETRIES)
+
+    def test_mt7922_exhaustion_then_success_rearms(self):
+        dev = self.BtkMtkDevice(dev_id=0x7922)
+        for _ in range(self.MAX_RETRIES + 2):
+            dev.setup_fw_handler(-110)
+        self.assertEqual(dev.reset_count, self.MAX_RETRIES)
+
+        dev.setup_fw_handler(0)
+        dev.setup_complete()
+        self.assertEqual(dev.fw_dl_retries, 0)
+
+        dev.setup_fw_handler(-110)
+        self.assertEqual(dev.reset_count, self.MAX_RETRIES + 1)
+        self.assertEqual(dev.fw_dl_retries, 1)
+
     def test_wmt_repeated_timeouts_bounded_at_max(self):
         dev = self.BtkMtkDevice()
         for i in range(1, self.MAX_RETRIES + 1):
@@ -519,6 +683,71 @@ class TestBoundedRetryLogicModel(unittest.TestCase):
         self.assertEqual(ret, -110)
         self.assertEqual(dev.reset_count, 0)
         self.assertEqual(dev.wmt_retries, 0)
+
+    def test_fw_retry_param_limits_both_devices(self):
+        """Non-default fw_dl_retry_count values bound MT7925 and MT7922 resets."""
+        for dev_id in (0x7925, 0x7922):
+            for limit in (FW_DL_RETRY_MIN, 1, 5, FW_DL_RETRY_MAX):
+                with self.subTest(dev_id=hex(dev_id), limit=limit):
+                    dev = self.BtkMtkDevice(dev_id=dev_id, fw_dl_retry_count=limit)
+                    for i in range(1, limit + 1):
+                        ret = dev.setup_fw_handler(-110)
+                        self.assertEqual(ret, -110)
+                        self.assertEqual(dev.reset_count, i)
+                        self.assertEqual(dev.fw_dl_retries, i)
+                    ret = dev.setup_fw_handler(-110)
+                    self.assertEqual(ret, -110)
+                    self.assertEqual(dev.reset_count, limit)
+                    self.assertEqual(dev.fw_dl_retries, limit)
+
+    def test_custom_fw_retry_count_rearms_after_success(self):
+        dev = self.BtkMtkDevice(dev_id=0x7925, fw_dl_retry_count=2)
+        dev.setup_fw_handler(-110)
+        dev.setup_fw_handler(-110)
+        dev.setup_fw_handler(-110)
+        self.assertEqual(dev.reset_count, 2)
+        self.assertEqual(dev.fw_dl_retries, 2)
+
+        self.assertEqual(dev.setup_fw_handler(0), 0)
+        dev.setup_complete()
+        self.assertEqual(dev.fw_dl_retries, 0)
+
+        dev.setup_fw_handler(-110)
+        self.assertEqual(dev.reset_count, 3)
+        self.assertEqual(dev.fw_dl_retries, 1)
+
+    def test_fw_retry_param_does_not_change_wmt_limit(self):
+        dev = self.BtkMtkDevice(fw_dl_retry_count=0)
+        for i in range(1, self.MAX_RETRIES + 1):
+            ret = dev.setup_wmt_handler(-110)
+            self.assertEqual(ret, -110)
+            self.assertEqual(dev.wmt_retries, i)
+            self.assertEqual(dev.reset_count, i)
+        dev.setup_wmt_handler(-110)
+        self.assertEqual(dev.wmt_retries, self.MAX_RETRIES)
+        self.assertEqual(dev.fw_dl_retries, 0)
+
+    def test_fw_dl_retry_count_setter_bounds(self):
+        """Mirror param_set_uint_minmax: keep the previous value when rejected."""
+        current = FW_DL_RETRY_DEFAULT
+        accepted = {
+            "0": FW_DL_RETRY_MIN,
+            "3": FW_DL_RETRY_DEFAULT,
+            "10": FW_DL_RETRY_MAX,
+            "10\n": FW_DL_RETRY_MAX,
+            "0xA": 10,
+            "0x0": 0,
+        }
+        for raw, expected in accepted.items():
+            with self.subTest(raw=raw):
+                current = set_fw_dl_retry_count(current, raw)
+                self.assertEqual(current, expected)
+
+        rejected = ["11", "11\n", "100", "-1", "foo", "", "0xB", "08", " 5", "+5"]
+        for raw in rejected:
+            with self.subTest(raw=raw):
+                kept = set_fw_dl_retry_count(current, raw)
+                self.assertEqual(kept, current)
 
 
 class TestCUnitTests(unittest.TestCase):
@@ -602,7 +831,15 @@ class TestModuleSigning(unittest.TestCase):
         return fake_sign_file, log
 
     def test_signing_skips_with_warning_when_not_configured(self):
-        result = self.run_signer("sign", "--kernel", "6.12.0", "--module", self.module)
+        fake_bin = os.path.join(self.tmp, "fake-bin")
+        os.makedirs(fake_bin)
+        mokutil = os.path.join(fake_bin, "mokutil")
+        with open(mokutil, "w", encoding="utf-8") as tool:
+            tool.write("#!/bin/sh\necho 'SecureBoot disabled'\n")
+        os.chmod(mokutil, 0o755)
+        env = self.env.copy()
+        env["PATH"] = fake_bin + os.pathsep + env.get("PATH", "")
+        result = self.run_signer("sign", "--kernel", "6.12.0", "--module", self.module, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Secure Boot signing is not configured", result.stderr)
         self.assertIn("Skipping module signing", result.stderr)
@@ -1108,30 +1345,52 @@ class TestKernelModuleBuild(unittest.TestCase):
         kbuild_dir = f"/lib/modules/{kver}/build"
 
         if not os.path.isdir(kbuild_dir):
+            import glob
+
+            for cand in sorted(glob.glob("/lib/modules/*/build")):
+                if os.path.isdir(cand):
+                    kbuild_dir = cand
+                    break
+
+        if not os.path.isdir(kbuild_dir):
             self.skipTest(f"Kernel build headers not found at {kbuild_dir}")
 
-        build_res = subprocess.run(
-            ["make", "-C", kbuild_dir, f"M={REPO_ROOT}", "modules"],
-            capture_output=True,
-            text=True,
-            cwd=REPO_ROOT,
-        )
-        self.assertEqual(
-            build_res.returncode,
-            0,
-            f"Kernel module build failed:\nSTDOUT:\n{build_res.stdout}\nSTDERR:\n{build_res.stderr}",
-        )
+        try:
+            build_res = subprocess.run(
+                ["make", "-C", kbuild_dir, f"M={REPO_ROOT}", "modules"],
+                capture_output=True,
+                text=True,
+                cwd=REPO_ROOT,
+            )
+            self.assertEqual(
+                build_res.returncode,
+                0,
+                f"Kernel module build failed:\nSTDOUT:\n{build_res.stdout}\nSTDERR:\n{build_res.stderr}",
+            )
 
-        ko_file = os.path.join(REPO_ROOT, "btmtk.ko")
-        self.assertTrue(os.path.isfile(ko_file), "btmtk.ko was not produced")
+            ko_file = os.path.join(REPO_ROOT, "btmtk.ko")
+            self.assertTrue(os.path.isfile(ko_file), "btmtk.ko was not produced")
 
-        clean_res = subprocess.run(
-            ["make", "-C", kbuild_dir, f"M={REPO_ROOT}", "clean"],
-            capture_output=True,
-            text=True,
-            cwd=REPO_ROOT,
-        )
-        self.assertEqual(clean_res.returncode, 0, f"Clean failed:\n{clean_res.stderr}")
+            with open(ko_file, "rb") as ko:
+                modinfo = ko.read().decode("latin1")
+            self.assertIn(
+                "fw_dl_retry_count:" + FW_DL_RETRY_PARM_DESC,
+                modinfo,
+                "btmtk.ko modinfo must document fw_dl_retry_count, its default, and its range",
+            )
+            self.assertIn(
+                "fw_dl_retry_count:uint",
+                modinfo,
+                "btmtk.ko modinfo must type fw_dl_retry_count as uint",
+            )
+        finally:
+            clean_res = subprocess.run(
+                ["make", "-C", kbuild_dir, f"M={REPO_ROOT}", "clean"],
+                capture_output=True,
+                text=True,
+                cwd=REPO_ROOT,
+            )
+            self.assertEqual(clean_res.returncode, 0, f"Clean failed:\n{clean_res.stderr}")
 
     def test_older_kernel_module_compilation(self):
         """Verifies compile-only build against older kernel headers in [6.4, 6.12) if available."""

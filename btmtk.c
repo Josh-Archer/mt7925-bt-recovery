@@ -25,6 +25,29 @@
 
 #define VERSION "0.1"
 
+/* Reset retries after a firmware-download failure on MT7922 and MT7925.
+ * 0 disables the reset retry. Values outside the min/max bounds are rejected.
+ */
+static unsigned int fw_dl_retry_count = BTMTK_FW_DL_RETRY_DEFAULT;
+
+static int btmtk_fw_dl_retry_count_set(const char *val,
+				       const struct kernel_param *kp)
+{
+	return param_set_uint_minmax(val, kp, BTMTK_FW_DL_RETRY_MIN,
+				     BTMTK_FW_DL_RETRY_MAX);
+}
+
+static const struct kernel_param_ops btmtk_fw_dl_retry_count_ops = {
+	.set = btmtk_fw_dl_retry_count_set,
+	.get = param_get_uint,
+};
+
+module_param_cb(fw_dl_retry_count, &btmtk_fw_dl_retry_count_ops,
+		&fw_dl_retry_count, 0644);
+__MODULE_PARM_TYPE(fw_dl_retry_count, "uint");
+MODULE_PARM_DESC(fw_dl_retry_count,
+		 "Firmware download reset retries for MT7922 and MT7925 (default 3, range 0-10)");
+
 /* It is for mt79xx download rom patch*/
 #define MTK_FW_ROM_PATCH_HEADER_SIZE	32
 #define MTK_FW_ROM_PATCH_GD_SIZE	64
@@ -1352,15 +1375,15 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 		err = btmtk_setup_firmware_79xx(hdev, fw_bin_name,
 						btmtk_usb_hci_wmt_sync);
 		if (err < 0) {
-			/* Recover from a MT7925 firmware-download failure up to retry limit. */
-			if (dev_id == 0x7925) {
-				if (btmtk_data->fw_dl_retries < BTMTK_FW_DL_MAX_RETRIES) {
+			/* Recover from a MT7925/MT7922 firmware-download failure up to retry limit. */
+			if (dev_id == 0x7925 || dev_id == 0x7922) {
+				if (btmtk_data->fw_dl_retries < fw_dl_retry_count) {
 					btmtk_data->fw_dl_retries++;
 					btmtk_reset_sync(hdev);
 				} else {
 					bt_dev_err(hdev,
-						   "Firmware download failed: max retries (%d) reached, skipping reset",
-						   BTMTK_FW_DL_MAX_RETRIES);
+						   "Firmware download failed: max retries (%u) reached, skipping reset",
+						   fw_dl_retry_count);
 				}
 			}
 

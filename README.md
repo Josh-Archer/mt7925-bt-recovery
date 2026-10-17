@@ -2,8 +2,9 @@
 
 Some MediaTek MT7925 Bluetooth controllers time out while downloading firmware
 (`-110`), leaving no controller available after boot. We fixed it with this
-custom DKMS driver, which resets the controller and retries the failed setup
-once.
+custom DKMS driver, which resets the controller and retries the failed setup.
+MT7922 uses the same firmware-download retry. How many times to retry is the
+`fw_dl_retry_count` module parameter (default 3, range 0-10).
 
 It is an out-of-tree backport for the Linux `btmtk` driver.
 
@@ -53,10 +54,20 @@ MOK_CERT=/path/to/your/MOK.der
 # HASH_ALGO=sha256
 ```
 
-For automatic signing across kernel upgrades, a `POST_BUILD` hook is configured
-in `dkms.conf` to run `scripts/sign-module.sh`. On DKMS 3.x, you can also configure
-`mok_signing_key` and `mok_certificate` in `/etc/dkms/framework.conf`
-(`sign_tool` was dropped in DKMS 3.x).
+For automatic signing across kernel upgrades, DKMS 3.x signs built modules
+using its native framework configuration. Set `mok_signing_key` and
+`mok_certificate` in `/etc/dkms/framework.conf` when you want to use a custom
+key. DKMS's native signing also uses its distribution defaults when those
+settings are omitted. On Ubuntu this can be the default MOK at
+`/var/lib/shim-signed/mok/MOK.priv` and `MOK.der`. No project signing hook is
+needed; DKMS signs the module in its build flow before saving the copy it later
+installs. The `POST_BUILD` hook is intentionally not used because it runs
+after that saved copy is made.
+
+Automatic signing through these framework settings is supported with DKMS 3.x.
+DKMS 2.x does not provide this native signing flow; sign the installed module
+manually with this script after each DKMS build/install. The framework options
+and build hook order are documented in the [DKMS manual](https://github.com/dkms-project/dkms/blob/main/dkms.8.in).
 
 The script accepts `--key` and `--cert` options as well. It targets the
 installed module under `/lib/modules/<kernel>/updates/dkms` (handling `.ko`,
@@ -67,3 +78,25 @@ a warning when Secure Boot is disabled or unknown; if Secure Boot is enabled,
 signing must be configured or the script exits with an error. If only one path
 is configured or a configured file is missing, the script exits with a
 descriptive error. `scripts/sign-module.sh --help` lists all options.
+
+## Module parameters
+
+`fw_dl_retry_count` (unsigned integer, default 3, range 0-10)
+
+Maximum number of controller resets after a firmware-download failure on
+MT7922 (`0x7922`) and MT7925 (`0x7925`). `0` disables that reset retry.
+Values outside 0-10 are rejected at load time and when written at runtime.
+This does not change the separate WMT func-ctrl timeout retry limit.
+
+`modinfo btmtk` prints the parameter, its default, and its range. Examples:
+
+```bash
+# load time
+sudo modprobe btmtk fw_dl_retry_count=5
+
+# runtime, after the module is loaded
+echo 5 | sudo tee /sys/module/btmtk/parameters/fw_dl_retry_count
+
+# persist across boots
+echo 'options btmtk fw_dl_retry_count=5' | sudo tee /etc/modprobe.d/btmtk.conf
+```
