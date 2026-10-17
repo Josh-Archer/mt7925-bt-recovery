@@ -1352,8 +1352,8 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 		err = btmtk_setup_firmware_79xx(hdev, fw_bin_name,
 						btmtk_usb_hci_wmt_sync);
 		if (err < 0) {
-			/* Recover from a MT7925 firmware-download failure up to retry limit. */
-			if (dev_id == 0x7925) {
+			/* Recover from a MT7925/MT7922 firmware-download failure up to retry limit. */
+			if (dev_id == 0x7925 || dev_id == 0x7922) {
 				if (btmtk_data->fw_dl_retries < BTMTK_FW_DL_MAX_RETRIES) {
 					btmtk_data->fw_dl_retries++;
 					btmtk_reset_sync(hdev);

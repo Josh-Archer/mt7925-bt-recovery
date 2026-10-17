@@ -39,8 +39,8 @@ static int btmtk_usb_setup_fw_handler(struct hci_dev *hdev, struct btmtk_data *b
 				      uint32_t dev_id, int fw_err)
 {
 	if (fw_err < 0) {
-		/* Recover from a MT7925 firmware-download failure up to retry limit. */
-		if (dev_id == 0x7925) {
+		/* Recover from a MT7925/MT7922 firmware-download failure up to retry limit. */
+		if (dev_id == 0x7925 || dev_id == 0x7922) {
 			if (btmtk_data->fw_dl_retries < BTMTK_FW_DL_MAX_RETRIES) {
 				btmtk_data->fw_dl_retries++;
 				btmtk_reset_sync(hdev, btmtk_data);
@@ -190,6 +190,107 @@ static void test_other_dev_ids_not_affected(void)
 	printf("PASS: test_other_dev_ids_not_affected\n");
 }
 
+static void test_mt7922_repeated_failures_reset_at_most_max_times(void)
+{
+	struct hci_dev hdev = { .name = "hci0" };
+	struct btmtk_data data = { .flags = 0, .dev_id = 0x7922, .fw_dl_retries = 0, .wmt_retries = 0, .reset_calls = 0 };
+	int ret;
+
+	/* 1st failure: reset requested, counter increments to 1 */
+	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7922, -110);
+	assert(ret == -110);
+	assert(data.reset_calls == 1);
+	assert(data.fw_dl_retries == 1);
+
+	/* 2nd failure: reset requested, counter increments to 2 */
+	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7922, -110);
+	assert(ret == -110);
+	assert(data.reset_calls == 2);
+	assert(data.fw_dl_retries == 2);
+
+	/* 3rd failure: reset requested, counter increments to 3 (MAX reached) */
+	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7922, -110);
+	assert(ret == -110);
+	assert(data.reset_calls == 3);
+	assert(data.fw_dl_retries == 3);
+
+	/* 4th failure: limit reached, NO reset requested, counter stays 3 */
+	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7922, -110);
+	assert(ret == -110);
+	assert(data.reset_calls == 3);
+	assert(data.fw_dl_retries == 3);
+
+	/* 5th failure: still no reset requested */
+	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7922, -110);
+	assert(ret == -110);
+	assert(data.reset_calls == 3);
+	assert(data.fw_dl_retries == 3);
+
+	printf("PASS: test_mt7922_repeated_failures_reset_at_most_max_times\n");
+}
+
+static void test_mt7922_success_rearms_recovery(void)
+{
+	struct hci_dev hdev = { .name = "hci0" };
+	struct btmtk_data data = { .flags = 0, .dev_id = 0x7922, .fw_dl_retries = 0, .wmt_retries = 0, .reset_calls = 0 };
+	int ret;
+
+	/* Fail twice */
+	btmtk_usb_setup_fw_handler(&hdev, &data, 0x7922, -110);
+	btmtk_usb_setup_fw_handler(&hdev, &data, 0x7922, -110);
+	assert(data.reset_calls == 2);
+	assert(data.fw_dl_retries == 2);
+
+	/* Setup succeeds */
+	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7922, 0);
+	assert(ret == 0);
+	btmtk_usb_setup_complete(&data);
+	assert(data.fw_dl_retries == 0);
+	assert(data.reset_calls == 2);
+
+	/* Now failure occurs again: recovery must be re-armed */
+	for (int i = 1; i <= BTMTK_FW_DL_MAX_RETRIES; i++) {
+		ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7922, -110);
+		assert(ret == -110);
+		assert(data.reset_calls == 2 + i);
+		assert(data.fw_dl_retries == (uint32_t)i);
+	}
+
+	/* Subsequent failure stops resetting */
+	ret = btmtk_usb_setup_fw_handler(&hdev, &data, 0x7922, -110);
+	assert(ret == -110);
+	assert(data.reset_calls == 2 + BTMTK_FW_DL_MAX_RETRIES);
+	assert(data.fw_dl_retries == BTMTK_FW_DL_MAX_RETRIES);
+
+	printf("PASS: test_mt7922_success_rearms_recovery\n");
+}
+
+static void test_mt7922_exhaustion_then_success_rearms(void)
+{
+	struct hci_dev hdev = { .name = "hci0" };
+	struct btmtk_data data = { .flags = 0, .dev_id = 0x7922, .fw_dl_retries = 0, .wmt_retries = 0, .reset_calls = 0 };
+
+	/* Exhaust all retries */
+	for (int i = 0; i < BTMTK_FW_DL_MAX_RETRIES + 2; i++) {
+		btmtk_usb_setup_fw_handler(&hdev, &data, 0x7922, -110);
+	}
+	assert(data.reset_calls == BTMTK_FW_DL_MAX_RETRIES);
+	assert(data.fw_dl_retries == BTMTK_FW_DL_MAX_RETRIES);
+
+	/* Setup completes successfully, re-arming recovery */
+	btmtk_usb_setup_fw_handler(&hdev, &data, 0x7922, 0);
+	btmtk_usb_setup_complete(&data);
+	assert(data.fw_dl_retries == 0);
+	assert(data.reset_calls == BTMTK_FW_DL_MAX_RETRIES);
+
+	/* Next failure triggers reset */
+	btmtk_usb_setup_fw_handler(&hdev, &data, 0x7922, -110);
+	assert(data.reset_calls == BTMTK_FW_DL_MAX_RETRIES + 1);
+	assert(data.fw_dl_retries == 1);
+
+	printf("PASS: test_mt7922_exhaustion_then_success_rearms\n");
+}
+
 static void test_wmt_repeated_timeouts_reset_at_most_max_times(void)
 {
 	struct hci_dev hdev = { .name = "hci0" };
@@ -330,6 +431,9 @@ int main(void)
 	test_success_rearms_recovery();
 	test_exhaustion_then_success_rearms();
 	test_other_dev_ids_not_affected();
+	test_mt7922_repeated_failures_reset_at_most_max_times();
+	test_mt7922_success_rearms_recovery();
+	test_mt7922_exhaustion_then_success_rearms();
 	test_wmt_repeated_timeouts_reset_at_most_max_times();
 	test_wmt_non_timeout_errors_do_not_reset();
 	test_wmt_success_rearms_recovery();
