@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Automated tests for MT7925 Bluetooth recovery driver (issues #2, #3, and #4).
+Automated tests for MT7925/MT7922 Bluetooth recovery driver (issues #2, #3, #4, and #6).
 
 Validates:
 1. C retry logic compiles and runs all test cases (verifying that repeated firmware
@@ -104,15 +104,27 @@ class TestSourceIntegrity(unittest.TestCase):
         )
 
     def test_fw_failure_bounded_reset(self):
-        """Ensure MT7925 firmware download failure checks retry limit before reset."""
+        """Ensure MT7925 and MT7922 firmware download failure checks retry limit before reset."""
         pattern = re.compile(
-            r"if\s*\(\s*dev_id\s*==\s*0x7925\s*\)\s*\{[^}]*fw_dl_retries\s*<\s*BTMTK_FW_DL_MAX_RETRIES[^}]*btmtk_reset_sync\s*\(\s*hdev\s*\)\s*;",
+            r"if\s*\(\s*(?:dev_id\s*==\s*0x7925\s*\|\|\s*dev_id\s*==\s*0x7922|dev_id\s*==\s*0x7922\s*\|\|\s*dev_id\s*==\s*0x7925)\s*\)\s*\{[^}]*fw_dl_retries\s*<\s*BTMTK_FW_DL_MAX_RETRIES[^}]*btmtk_reset_sync\s*\(\s*hdev\s*\)\s*;",
             re.DOTALL,
         )
         self.assertRegex(
             self.btmtk_c,
             pattern,
-            "MT7925 failure path must guard btmtk_reset_sync with fw_dl_retries < BTMTK_FW_DL_MAX_RETRIES",
+            "MT7925/MT7922 failure path must guard btmtk_reset_sync with fw_dl_retries < BTMTK_FW_DL_MAX_RETRIES",
+        )
+
+    def test_mt7922_included_in_fw_retry(self):
+        """Ensure MT7922 (0x7922) is included in firmware download recovery."""
+        pattern = re.compile(
+            r"if\s*\([^)]*0x7922[^)]*\)\s*\{[^}]*fw_dl_retries\s*<\s*BTMTK_FW_DL_MAX_RETRIES",
+            re.DOTALL,
+        )
+        self.assertRegex(
+            self.btmtk_c,
+            pattern,
+            "btmtk.c must include MT7922 (0x7922) in firmware download retry logic",
         )
 
     def test_fw_failure_increments_counter(self):
@@ -356,7 +368,7 @@ class TestBoundedRetryLogicModel(unittest.TestCase):
 
         def setup_fw_handler(self, fw_err):
             if fw_err < 0:
-                if self.dev_id == 0x7925:
+                if self.dev_id in (0x7925, 0x7922):
                     if self.fw_dl_retries < TestBoundedRetryLogicModel.MAX_RETRIES:
                         self.fw_dl_retries += 1
                         self.reset_count += 1
@@ -439,6 +451,59 @@ class TestBoundedRetryLogicModel(unittest.TestCase):
         self.assertEqual(ret, -110)
         self.assertEqual(dev.reset_count, 0)
         self.assertEqual(dev.fw_dl_retries, 0)
+
+    def test_mt7922_repeated_failures_bounded_at_max(self):
+        dev = self.BtkMtkDevice(dev_id=0x7922)
+        for i in range(1, self.MAX_RETRIES + 1):
+            ret = dev.setup_fw_handler(-110)
+            self.assertEqual(ret, -110)
+            self.assertEqual(dev.reset_count, i)
+            self.assertEqual(dev.fw_dl_retries, i)
+
+        # Additional failures after reaching max do not trigger further resets
+        for _ in range(5):
+            ret = dev.setup_fw_handler(-110)
+            self.assertEqual(ret, -110)
+            self.assertEqual(dev.reset_count, self.MAX_RETRIES)
+            self.assertEqual(dev.fw_dl_retries, self.MAX_RETRIES)
+
+    def test_mt7922_setup_success_rearms_recovery(self):
+        dev = self.BtkMtkDevice(dev_id=0x7922)
+        # Fail twice
+        dev.setup_fw_handler(-110)
+        dev.setup_fw_handler(-110)
+        self.assertEqual(dev.reset_count, 2)
+        self.assertEqual(dev.fw_dl_retries, 2)
+
+        # Setup succeeds
+        self.assertEqual(dev.setup_fw_handler(0), 0)
+        dev.setup_complete()
+        self.assertEqual(dev.fw_dl_retries, 0)
+        self.assertEqual(dev.reset_count, 2)
+
+        # Recovery is re-armed: next failures trigger resets up to MAX
+        for i in range(1, self.MAX_RETRIES + 1):
+            dev.setup_fw_handler(-110)
+            self.assertEqual(dev.reset_count, 2 + i)
+            self.assertEqual(dev.fw_dl_retries, i)
+
+        # Stops after MAX
+        dev.setup_fw_handler(-110)
+        self.assertEqual(dev.reset_count, 2 + self.MAX_RETRIES)
+
+    def test_mt7922_exhaustion_then_success_rearms(self):
+        dev = self.BtkMtkDevice(dev_id=0x7922)
+        for _ in range(self.MAX_RETRIES + 2):
+            dev.setup_fw_handler(-110)
+        self.assertEqual(dev.reset_count, self.MAX_RETRIES)
+
+        dev.setup_fw_handler(0)
+        dev.setup_complete()
+        self.assertEqual(dev.fw_dl_retries, 0)
+
+        dev.setup_fw_handler(-110)
+        self.assertEqual(dev.reset_count, self.MAX_RETRIES + 1)
+        self.assertEqual(dev.fw_dl_retries, 1)
 
     def test_wmt_repeated_timeouts_bounded_at_max(self):
         dev = self.BtkMtkDevice()
