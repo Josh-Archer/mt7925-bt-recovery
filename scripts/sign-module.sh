@@ -22,8 +22,8 @@ Commands:
 Options:
   --key PATH      Path to MOK private key file (overrides MOK_KEY).
   --cert PATH     Path to MOK X.509 certificate file (overrides MOK_CERT).
-  --hash ALGO     Hash algorithm for module signing (default: sha256).
-  --module PATH   Path to btmtk.ko kernel module to sign.
+  --hash ALGO     Hash algorithm for module signing: sha256, sha384, sha512 (default: sha256).
+  --module PATH   Path to btmtk.ko kernel module to sign (handles .ko, .ko.xz, .ko.zst).
   --kernel VER    Target kernel version (default: running kernel or $kernelver).
   --sign-file BIN Path to kernel sign-file binary (overrides auto-detection).
   --config PATH   Path to signing configuration file.
@@ -31,22 +31,31 @@ Options:
 
 Configuration:
   Configuration can be supplied via environment variables or a configuration file.
+  Private keys and certificates must come from a single consistent source.
+  Private keys must have 0600 or 0400 permissions and be owned by root or the caller.
   Default configuration file locations checked:
     1. Value of SIGN_CONF environment variable (if set)
     2. /etc/mt7925-bt-recovery/sign.conf
     3. /etc/dkms/sign.conf
     4. /etc/dkms/framework.conf (reads mok_signing_key and mok_certificate)
 
+  For automatic signing across kernel upgrades with DKMS 3.x, configure
+  mok_signing_key and mok_certificate in /etc/dkms/framework.conf.
+
   Variables:
     MOK_KEY       Path to private signing key.
     MOK_CERT      Path to X.509 public certificate (PEM or DER format).
-    HASH_ALGO     Signature digest algorithm (default: sha256).
+    HASH_ALGO     Signature digest algorithm: sha256, sha384, sha512 (default: sha256).
     SIGN_FILE     Path to kernel sign-file binary.
 
+  Notes:
+    - Signing is performed with the kernel's sign-file tool; kmodsign is not supported.
+
 Behavior:
-  - If Secure Boot signing is not configured (neither key nor cert specified),
-    the script emits a clear warning and exits successfully (exit code 0),
-    allowing standard DKMS installations without Secure Boot to proceed cleanly.
+  - If Secure Boot is enabled and signing is not configured (or files are missing),
+    the script terminates with an error (exit code 1).
+  - If Secure Boot is disabled or unknown and signing is not configured,
+    the script emits a warning and exits cleanly (exit code 0).
   - If signing is configured but any required file is missing or invalid, the
     script terminates immediately with a descriptive error (exit code 1).
 EOF
@@ -147,82 +156,242 @@ if [[ -z "$COMMAND" ]]; then
     COMMAND="sign"
 fi
 
-# Load configuration file if present
-load_config() {
-    local conf=""
+# Helpers for configuration parsing
+strip_val() {
+    local v="$1"
+    if [[ "$v" =~ ^[[:space:]]*\"([^\"]*)\"([[:space:]]*#.*)?$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$v" =~ ^[[:space:]]*\'([^\']*)\'([[:space:]]*#.*)?$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$v" =~ ^[[:space:]]*([^#]*)[[:space:]]*(#.*)?$ ]]; then
+        local unquoted="${BASH_REMATCH[1]}"
+        if [[ "$unquoted" =~ ^(.*[^[:space:]])[[:space:]]*$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+        else
+            echo "$unquoted"
+        fi
+    else
+        echo "$v"
+    fi
+}
+
+PARSED_KEY=""
+PARSED_CERT=""
+PARSED_HASH=""
+PARSED_SIGN_FILE=""
+
+parse_config_file() {
+    local conf="$1"
+    [[ -f "$conf" && -r "$conf" ]] || return 0
+
+    while IFS='=' read -r key val || [[ -n "$key" ]]; do
+        key="$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [[ "$key" =~ ^# ]] && continue
+        [[ -z "$key" ]] && continue
+        val="$(strip_val "$val")"
+        case "$key" in
+            MOK_KEY|mok_signing_key)
+                PARSED_KEY="${PARSED_KEY:-$val}"
+                ;;
+            MOK_CERT|mok_certificate)
+                PARSED_CERT="${PARSED_CERT:-$val}"
+                ;;
+            HASH_ALGO)
+                PARSED_HASH="${PARSED_HASH:-$val}"
+                ;;
+            SIGN_FILE|sign_file)
+                PARSED_SIGN_FILE="${PARSED_SIGN_FILE:-$val}"
+                ;;
+        esac
+    done < "$conf"
+}
+
+KEY_FILE=""
+CERT_FILE=""
+CONF_HASH=""
+CONF_SIGN_FILE=""
+
+resolve_credentials() {
+    # If command is enroll, only certificate is required
+    if [[ "$COMMAND" == "enroll" ]]; then
+        if [[ -n "$CLI_CERT" ]]; then
+            CERT_FILE="$CLI_CERT"
+            return 0
+        fi
+
+        local env_c="${MOK_CERT:-${MOK_CERTIFICATE:-}}"
+        if [[ -n "$env_c" ]]; then
+            CERT_FILE="$env_c"
+            return 0
+        fi
+
+        local explicit_conf=""
+        if [[ -n "$CLI_CONFIG" ]]; then
+            if [[ ! -f "$CLI_CONFIG" ]]; then
+                echo "Error: Specified configuration file not found at '$CLI_CONFIG'." >&2
+                exit 1
+            fi
+            explicit_conf="$CLI_CONFIG"
+        elif [[ -n "${SIGN_CONF:-}" ]]; then
+            if [[ ! -f "$SIGN_CONF" ]]; then
+                echo "Error: Configuration file specified by SIGN_CONF not found at '$SIGN_CONF'." >&2
+                exit 1
+            fi
+            explicit_conf="$SIGN_CONF"
+        fi
+
+        if [[ -n "$explicit_conf" ]]; then
+            PARSED_KEY=""
+            PARSED_CERT=""
+            PARSED_HASH=""
+            PARSED_SIGN_FILE=""
+            parse_config_file "$explicit_conf"
+            CERT_FILE="$PARSED_CERT"
+            return 0
+        fi
+
+        local conf_candidates=(
+            "/etc/mt7925-bt-recovery/sign.conf"
+            "/etc/dkms/sign.conf"
+            "/etc/dkms/framework.conf"
+        )
+        for conf in "${conf_candidates[@]}"; do
+            if [[ -f "$conf" ]]; then
+                PARSED_KEY=""
+                PARSED_CERT=""
+                PARSED_HASH=""
+                PARSED_SIGN_FILE=""
+                parse_config_file "$conf"
+                if [[ -n "$PARSED_CERT" ]]; then
+                    CERT_FILE="$PARSED_CERT"
+                    return 0
+                fi
+            fi
+        done
+        return 0
+    fi
+
+    # Command is sign: require both key and cert to come from a consistent source
+
+    # 1. Command-line options
+    if [[ -n "$CLI_KEY" || -n "$CLI_CERT" ]]; then
+        if [[ -z "$CLI_KEY" ]]; then
+            echo "Error: Incomplete Secure Boot configuration: MOK_CERT is set but MOK_KEY is missing." >&2
+            exit 1
+        fi
+        if [[ -z "$CLI_CERT" ]]; then
+            echo "Error: Incomplete Secure Boot configuration: MOK_KEY is set but MOK_CERT is missing." >&2
+            exit 1
+        fi
+        KEY_FILE="$CLI_KEY"
+        CERT_FILE="$CLI_CERT"
+        return 0
+    fi
+
+    # 2. Environment variables
+    local env_k="${MOK_KEY:-${MOK_SIGNING_KEY:-}}"
+    local env_c="${MOK_CERT:-${MOK_CERTIFICATE:-}}"
+    if [[ -n "$env_k" || -n "$env_c" ]]; then
+        if [[ -z "$env_k" ]]; then
+            echo "Error: Incomplete Secure Boot configuration: MOK_CERT is set but MOK_KEY is missing." >&2
+            exit 1
+        fi
+        if [[ -z "$env_c" ]]; then
+            echo "Error: Incomplete Secure Boot configuration: MOK_KEY is set but MOK_CERT is missing." >&2
+            exit 1
+        fi
+        KEY_FILE="$env_k"
+        CERT_FILE="$env_c"
+        return 0
+    fi
+
+    # 3. Explicit config file via CLI or SIGN_CONF
+    local explicit_conf=""
     if [[ -n "$CLI_CONFIG" ]]; then
         if [[ ! -f "$CLI_CONFIG" ]]; then
             echo "Error: Specified configuration file not found at '$CLI_CONFIG'." >&2
             exit 1
         fi
-        conf="$CLI_CONFIG"
+        explicit_conf="$CLI_CONFIG"
     elif [[ -n "${SIGN_CONF:-}" ]]; then
         if [[ ! -f "$SIGN_CONF" ]]; then
             echo "Error: Configuration file specified by SIGN_CONF not found at '$SIGN_CONF'." >&2
             exit 1
         fi
-        conf="$SIGN_CONF"
-    elif [[ -f "/etc/mt7925-bt-recovery/sign.conf" ]]; then
-        conf="/etc/mt7925-bt-recovery/sign.conf"
-    elif [[ -f "/etc/dkms/sign.conf" ]]; then
-        conf="/etc/dkms/sign.conf"
+        explicit_conf="$SIGN_CONF"
     fi
 
-    if [[ -n "$conf" && -r "$conf" ]]; then
-        # Source safe key=value pairs without arbitrary execution
-        while IFS='=' read -r key val || [[ -n "$key" ]]; do
-            # Trim leading/trailing whitespace
-            key="$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-            # Strip comments
-            [[ "$key" =~ ^# ]] && continue
-            [[ -z "$key" ]] && continue
-            val="$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^["'"'"']//' -e 's/["'"'"']$//')"
-            case "$key" in
-                MOK_KEY|mok_signing_key)
-                    MOK_KEY="${MOK_KEY:-$val}"
-                    ;;
-                MOK_CERT|mok_certificate)
-                    MOK_CERT="${MOK_CERT:-$val}"
-                    ;;
-                HASH_ALGO)
-                    HASH_ALGO="${HASH_ALGO:-$val}"
-                    ;;
-                SIGN_FILE|sign_file)
-                    SIGN_FILE="${SIGN_FILE:-$val}"
-                    ;;
-            esac
-        done < "$conf"
+    if [[ -n "$explicit_conf" ]]; then
+        PARSED_KEY=""
+        PARSED_CERT=""
+        PARSED_HASH=""
+        PARSED_SIGN_FILE=""
+        parse_config_file "$explicit_conf"
+        if [[ -n "$PARSED_KEY" || -n "$PARSED_CERT" ]]; then
+            if [[ -z "$PARSED_KEY" ]]; then
+                echo "Error: Incomplete Secure Boot configuration in '$explicit_conf': MOK_CERT is set but MOK_KEY is missing." >&2
+                exit 1
+            fi
+            if [[ -z "$PARSED_CERT" ]]; then
+                echo "Error: Incomplete Secure Boot configuration in '$explicit_conf': MOK_KEY is set but MOK_CERT is missing." >&2
+                exit 1
+            fi
+            KEY_FILE="$PARSED_KEY"
+            CERT_FILE="$PARSED_CERT"
+        fi
+        CONF_HASH="$PARSED_HASH"
+        CONF_SIGN_FILE="$PARSED_SIGN_FILE"
+        return 0
     fi
 
-    # Fallback to framework.conf if variables still empty
-    if [[ -z "${MOK_KEY:-}" || -z "${MOK_CERT:-}" ]] && [[ -f "/etc/dkms/framework.conf" ]]; then
-        while IFS='=' read -r key val || [[ -n "$key" ]]; do
-            key="$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-            [[ "$key" =~ ^# ]] && continue
-            [[ -z "$key" ]] && continue
-            val="$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^["'"'"']//' -e 's/["'"'"']$//')"
-            case "$key" in
-                mok_signing_key)
-                    MOK_KEY="${MOK_KEY:-$val}"
-                    ;;
-                mok_certificate)
-                    MOK_CERT="${MOK_CERT:-$val}"
-                    ;;
-                sign_file)
-                    SIGN_FILE="${SIGN_FILE:-$val}"
-                    ;;
-            esac
-        done < "/etc/dkms/framework.conf"
-    fi
+    # 4. Default config files in priority order
+    local conf_candidates=(
+        "/etc/mt7925-bt-recovery/sign.conf"
+        "/etc/dkms/sign.conf"
+        "/etc/dkms/framework.conf"
+    )
+    for conf in "${conf_candidates[@]}"; do
+        if [[ -f "$conf" ]]; then
+            PARSED_KEY=""
+            PARSED_CERT=""
+            PARSED_HASH=""
+            PARSED_SIGN_FILE=""
+            parse_config_file "$conf"
+            if [[ -n "$PARSED_KEY" || -n "$PARSED_CERT" ]]; then
+                if [[ -z "$PARSED_KEY" ]]; then
+                    echo "Error: Incomplete Secure Boot configuration in '$conf': MOK_CERT is set but MOK_KEY is missing." >&2
+                    exit 1
+                fi
+                if [[ -z "$PARSED_CERT" ]]; then
+                    echo "Error: Incomplete Secure Boot configuration in '$conf': MOK_KEY is set but MOK_CERT is missing." >&2
+                    exit 1
+                fi
+                KEY_FILE="$PARSED_KEY"
+                CERT_FILE="$PARSED_CERT"
+                CONF_HASH="$PARSED_HASH"
+                CONF_SIGN_FILE="$PARSED_SIGN_FILE"
+                return 0
+            fi
+            [[ -z "$CONF_HASH" ]] && CONF_HASH="$PARSED_HASH"
+            [[ -z "$CONF_SIGN_FILE" ]] && CONF_SIGN_FILE="$PARSED_SIGN_FILE"
+        fi
+    done
 }
 
-load_config
+resolve_credentials
 
-# Resolve active variables with precedence: CLI > ENV > Config file
-KEY_FILE="${CLI_KEY:-${MOK_KEY:-${MOK_SIGNING_KEY:-${KBUILD_SIGN_KEY:-}}}}"
-CERT_FILE="${CLI_CERT:-${MOK_CERT:-${MOK_CERTIFICATE:-${KBUILD_SIGN_PIN:-}}}}"
-HASH_ALGO="${CLI_HASH:-${HASH_ALGO:-sha256}}"
-SIGN_FILE_BIN="${CLI_SIGN_FILE:-${SIGN_FILE:-}}"
+# Resolve active digest and sign-file
+HASH_ALGO="${CLI_HASH:-${CONF_HASH:-${HASH_ALGO:-sha256}}}"
+case "$HASH_ALGO" in
+    sha256|sha384|sha512)
+        ;;
+    *)
+        echo "Error: Invalid hash algorithm '$HASH_ALGO'. Allowed algorithms: sha256, sha384, sha512." >&2
+        exit 1
+        ;;
+esac
+
+SIGN_FILE_BIN="${CLI_SIGN_FILE:-${CONF_SIGN_FILE:-${SIGN_FILE:-}}}"
 
 # Resolve kernel version: CLI > positional > $kernelver (from DKMS) > uname -r
 TARGET_KERNEL="${CLI_KERNEL:-}"
@@ -231,7 +400,7 @@ MODULE_TARGET="${CLI_MODULE:-}"
 for arg in "${POSITIONAL_ARGS[@]}"; do
     if [[ -z "$TARGET_KERNEL" && "$arg" =~ ^[0-9]+\.[0-9]+ ]]; then
         TARGET_KERNEL="$arg"
-    elif [[ -z "$MODULE_TARGET" && "$arg" =~ \.ko$ ]]; then
+    elif [[ -z "$MODULE_TARGET" && "$arg" =~ \.ko(\.(xz|zst))?$ ]]; then
         MODULE_TARGET="$arg"
     fi
 done
@@ -241,15 +410,20 @@ if [[ -z "$TARGET_KERNEL" ]]; then
 fi
 
 find_sign_file() {
-    if [[ -n "$SIGN_FILE_BIN" && -x "$SIGN_FILE_BIN" ]]; then
-        echo "$SIGN_FILE_BIN"
-        return 0
+    if [[ -n "$SIGN_FILE_BIN" ]]; then
+        if [[ -x "$SIGN_FILE_BIN" ]]; then
+            echo "$SIGN_FILE_BIN"
+            return 0
+        fi
+        echo "Error: Configured sign-file binary is not executable: '$SIGN_FILE_BIN'." >&2
+        return 1
     fi
 
+    local mod_base="${MODULES_DIR:-/lib/modules}"
     local candidates=(
-        "/lib/modules/${TARGET_KERNEL}/build/scripts/sign-file"
+        "${mod_base}/${TARGET_KERNEL}/build/scripts/sign-file"
         "/usr/src/linux-headers-${TARGET_KERNEL}/scripts/sign-file"
-        "/lib/modules/${TARGET_KERNEL}/source/scripts/sign-file"
+        "${mod_base}/${TARGET_KERNEL}/source/scripts/sign-file"
     )
 
     for cand in "${candidates[@]}"; do
@@ -259,8 +433,8 @@ find_sign_file() {
         fi
     done
 
-    # Check headers across /lib/modules/*/build/scripts/sign-file
-    for cand in /lib/modules/*/build/scripts/sign-file; do
+    # Check headers across modules/*/build/scripts/sign-file
+    for cand in "${mod_base}"/*/build/scripts/sign-file; do
         if [[ -x "$cand" ]]; then
             echo "$cand"
             return 0
@@ -294,13 +468,20 @@ find_module_file() {
         return 1
     fi
 
+    local mod_base="${MODULES_DIR:-/lib/modules}"
     local candidates=(
-        "./btmtk.ko"
-        "${dkms_tree:-/var/lib/dkms}/${PACKAGE_NAME:-mt7925-bt-recovery}/${PACKAGE_VERSION:-0.1}/build/btmtk.ko"
-        "/var/lib/dkms/${PACKAGE_NAME:-mt7925-bt-recovery}/${PACKAGE_VERSION:-0.1}/${TARGET_KERNEL}/$(uname -m)/module/btmtk.ko"
-        "/lib/modules/${TARGET_KERNEL}/updates/dkms/btmtk.ko"
-        "/lib/modules/${TARGET_KERNEL}/updates/btmtk.ko"
-        "/lib/modules/${TARGET_KERNEL}/extra/btmtk.ko"
+        "${mod_base}/${TARGET_KERNEL}/updates/dkms/btmtk.ko"
+        "${mod_base}/${TARGET_KERNEL}/updates/dkms/btmtk.ko.xz"
+        "${mod_base}/${TARGET_KERNEL}/updates/dkms/btmtk.ko.zst"
+        "${mod_base}/${TARGET_KERNEL}/updates/btmtk.ko"
+        "${mod_base}/${TARGET_KERNEL}/updates/btmtk.ko.xz"
+        "${mod_base}/${TARGET_KERNEL}/updates/btmtk.ko.zst"
+        "${mod_base}/${TARGET_KERNEL}/extra/btmtk.ko"
+        "${mod_base}/${TARGET_KERNEL}/extra/btmtk.ko.xz"
+        "${mod_base}/${TARGET_KERNEL}/extra/btmtk.ko.zst"
+        "${mod_base}/${TARGET_KERNEL}/kernel/drivers/bluetooth/btmtk.ko"
+        "${mod_base}/${TARGET_KERNEL}/kernel/drivers/bluetooth/btmtk.ko.xz"
+        "${mod_base}/${TARGET_KERNEL}/kernel/drivers/bluetooth/btmtk.ko.zst"
     )
 
     for cand in "${candidates[@]}"; do
@@ -310,10 +491,10 @@ find_module_file() {
         fi
     done
 
-    # Fallback search in /lib/modules/${TARGET_KERNEL}
-    if [[ -d "/lib/modules/${TARGET_KERNEL}" ]]; then
+    # Fallback search in ${mod_base}/${TARGET_KERNEL}
+    if [[ -d "${mod_base}/${TARGET_KERNEL}" ]]; then
         local found
-        found="$(find "/lib/modules/${TARGET_KERNEL}" -name "btmtk.ko" 2>/dev/null | head -n 1)"
+        found="$(find "${mod_base}/${TARGET_KERNEL}" -name "btmtk.ko*" 2>/dev/null | head -n 1)"
         if [[ -n "$found" && -f "$found" ]]; then
             echo "$found"
             return 0
@@ -323,12 +504,109 @@ find_module_file() {
     return 1
 }
 
+is_secure_boot_enabled() {
+    if command -v mokutil >/dev/null 2>&1; then
+        local sb_state
+        sb_state="$(mokutil --sb-state 2>/dev/null || true)"
+        if [[ "$sb_state" =~ [Ss]ecure[Bb]oot[[:space:]]+enabled ]]; then
+            return 0
+        elif [[ "$sb_state" =~ [Ss]ecure[Bb]oot[[:space:]]+disabled ]]; then
+            return 1
+        fi
+    fi
+
+    for efivar in /sys/firmware/efi/efivars/SecureBoot-*; do
+        if [[ -f "$efivar" ]]; then
+            local data
+            data="$(od -An -t u1 -j 4 -N 1 "$efivar" 2>/dev/null || true)"
+            if [[ "${data//[[:space:]]/}" == "1" ]]; then
+                return 0
+            elif [[ "${data//[[:space:]]/}" == "0" ]]; then
+                return 1
+            fi
+        fi
+    done
+
+    return 2
+}
+
+sign_target_module() {
+    local mod_file="$1"
+    local sign_bin="$2"
+
+    echo "Signing kernel module '${mod_file}' for kernel ${TARGET_KERNEL} using ${HASH_ALGO}..."
+
+    if [[ "$mod_file" =~ \.(xz|zst)$ ]]; then
+        local ext="${BASH_REMATCH[1]}"
+        local tmpdir
+        tmpdir="$(mktemp -d -t dkms-sign.XXXXXXXXXX)"
+        local base_mod
+        base_mod="$(basename "$mod_file" ".$ext")"
+        local uncompressed="${tmpdir}/${base_mod}"
+
+        if [[ "$ext" == "xz" ]]; then
+            if ! command -v xz >/dev/null 2>&1; then
+                rm -rf "$tmpdir"
+                echo "Error: 'xz' command not found to decompress/recompress module '${mod_file}'." >&2
+                exit 1
+            fi
+            xz -d -c "$mod_file" > "$uncompressed"
+        elif [[ "$ext" == "zst" ]]; then
+            if ! command -v zstd >/dev/null 2>&1; then
+                rm -rf "$tmpdir"
+                echo "Error: 'zstd' command not found to decompress/recompress module '${mod_file}'." >&2
+                exit 1
+            fi
+            zstd -d -q -c "$mod_file" > "$uncompressed"
+        fi
+
+        if ! "$sign_bin" "$HASH_ALGO" "$KEY_FILE" "$CERT_FILE" "$uncompressed"; then
+            local status=$?
+            rm -rf "$tmpdir"
+            echo "Error: Failed to sign ${mod_file} with sign-file (exit code ${status})." >&2
+            exit "$status"
+        fi
+
+        local recompressed="${tmpdir}/recompressed.${ext}"
+        if [[ "$ext" == "xz" ]]; then
+            xz -c "$uncompressed" > "$recompressed"
+        elif [[ "$ext" == "zst" ]]; then
+            zstd -f -q "$uncompressed" -o "$recompressed"
+        fi
+
+        chmod --reference="$mod_file" "$recompressed" 2>/dev/null || true
+        chown --reference="$mod_file" "$recompressed" 2>/dev/null || true
+        mv -f "$recompressed" "$mod_file"
+        rm -rf "$tmpdir"
+    else
+        if ! "$sign_bin" "$HASH_ALGO" "$KEY_FILE" "$CERT_FILE" "$mod_file"; then
+            local status=$?
+            echo "Error: Failed to sign ${mod_file} with sign-file (exit code ${status})." >&2
+            exit "$status"
+        fi
+    fi
+
+    echo "Successfully signed ${mod_file} for Secure Boot."
+}
+
 do_sign() {
     # Check if signing is configured
     if [[ -z "$KEY_FILE" && -z "$CERT_FILE" ]]; then
-        echo "Warning: Secure Boot signing is not configured (MOK_KEY / MOK_CERT not set)." >&2
-        echo "Skipping module signing for kernel ${TARGET_KERNEL}." >&2
-        exit 0
+        local sb_status=2
+        if is_secure_boot_enabled; then
+            sb_status=0
+        elif [[ $? -eq 1 ]]; then
+            sb_status=1
+        fi
+
+        if [[ "$sb_status" -eq 0 ]]; then
+            echo "Error: Secure Boot is enabled, but module signing is not configured (MOK_KEY / MOK_CERT not set)." >&2
+            exit 1
+        else
+            echo "Warning: Secure Boot signing is not configured (MOK_KEY / MOK_CERT not set)." >&2
+            echo "Skipping module signing for kernel ${TARGET_KERNEL}." >&2
+            exit 0
+        fi
     fi
 
     # Incomplete configuration check
@@ -342,9 +620,26 @@ do_sign() {
         exit 1
     fi
 
-    # Validate file presence
+    # Validate file presence (do not print private key path)
     if [[ ! -f "$KEY_FILE" ]]; then
-        echo "Error: MOK private key file not found at: '$KEY_FILE'." >&2
+        echo "Error: MOK private key file not found." >&2
+        exit 1
+    fi
+
+    # Validate private key permissions and ownership (do not print private key path)
+    local key_stat key_mode key_uid
+    key_stat="$(stat -c '%a %u' "$KEY_FILE" 2>/dev/null || true)"
+    read -r key_mode key_uid <<< "$key_stat" || true
+
+    if [[ "$key_mode" != "600" && "$key_mode" != "0600" && "$key_mode" != "400" && "$key_mode" != "0400" ]]; then
+        echo "Error: MOK private key has insecure permissions: mode must be 0600 or 0400." >&2
+        exit 1
+    fi
+
+    local current_uid
+    current_uid="$(id -u)"
+    if [[ "$key_uid" != "0" && "$key_uid" != "$current_uid" && ( -z "${SUDO_UID:-}" || "$key_uid" != "$SUDO_UID" ) ]]; then
+        echo "Error: MOK private key has invalid owner: must be owned by root or the caller." >&2
         exit 1
     fi
 
@@ -357,7 +652,7 @@ do_sign() {
     local mod_file
     if ! mod_file="$(find_module_file)"; then
         echo "Error: btmtk.ko module not found for kernel ${TARGET_KERNEL}." >&2
-        echo "Build the driver first or specify path with --module." >&2
+        echo "Build and install the driver first or specify path with --module." >&2
         exit 1
     fi
 
@@ -369,15 +664,7 @@ do_sign() {
         exit 1
     fi
 
-    # Perform signature
-    echo "Signing kernel module '${mod_file}' for kernel ${TARGET_KERNEL} using ${HASH_ALGO}..."
-    if "$sign_bin" "$HASH_ALGO" "$KEY_FILE" "$CERT_FILE" "$mod_file"; then
-        echo "Successfully signed ${mod_file} for Secure Boot."
-    else
-        local status=$?
-        echo "Error: Failed to sign ${mod_file} with sign-file (exit code ${status})." >&2
-        exit "$status"
-    fi
+    sign_target_module "$mod_file" "$sign_bin"
 }
 
 do_enroll() {

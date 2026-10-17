@@ -29,7 +29,8 @@ sudo dkms install -m mt7925-bt-recovery -v 0.1
 When Secure Boot is enabled, the module must be signed with a key trusted by
 the machine and that key's certificate must be enrolled through MOK. The script
 uses an existing private key and certificate; it does not create keys. Keep
-both files outside this repository and restrict access to the private key.
+both files outside this repository. Private keys must have 0600 or 0400
+permissions and be owned by root or the caller.
 
 Set `MOK_KEY` and `MOK_CERT` to the paths for your MOK private key and
 certificate. For example, with the standard Ubuntu shim-signed key locations:
@@ -52,9 +53,17 @@ MOK_CERT=/path/to/your/MOK.der
 # HASH_ALGO=sha256
 ```
 
-The script accepts `--key` and `--cert` options as well. It finds `btmtk.ko`
-for the running kernel by default; pass `--kernel VERSION` and `--module PATH`
-to select a different build. If neither signing path is configured, signing is
-skipped with a warning so systems without Secure Boot can install normally. If
-only one path is configured or a configured file is missing, the script exits
-with a descriptive error. `scripts/sign-module.sh --help` lists all options.
+For automatic signing across kernel upgrades on DKMS 3.x, configure
+`mok_signing_key` and `mok_certificate` in `/etc/dkms/framework.conf`
+(`sign_tool` was dropped in DKMS 3.x). Older DKMS setups can invoke
+`scripts/sign-module.sh` (or `sign_tool`).
+
+The script accepts `--key` and `--cert` options as well. It targets the
+installed module under `/lib/modules/<kernel>/updates/dkms` (handling `.ko`,
+`.ko.xz`, and `.ko.zst`); pass `--kernel VERSION` and `--module PATH` to select
+a different build. Signing uses the kernel's `sign-file` utility (`kmodsign`
+is not supported). If neither signing path is configured, signing is skipped with
+a warning when Secure Boot is disabled or unknown; if Secure Boot is enabled,
+signing must be configured or the script exits with an error. If only one path
+is configured or a configured file is missing, the script exits with a
+descriptive error. `scripts/sign-module.sh --help` lists all options.

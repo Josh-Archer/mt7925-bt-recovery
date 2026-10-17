@@ -26,6 +26,7 @@ Validates:
    without loading modules or touching the host's Bluetooth system.
 """
 
+import lzma
 import os
 import re
 import subprocess
@@ -567,11 +568,12 @@ class TestModuleSigning(unittest.TestCase):
             check=False,
         )
         self.assertEqual(keygen.returncode, 0, f"Temporary test key generation failed: {keygen.stderr}")
+        os.chmod(self.key, 0o600)
         self.module = os.path.join(self.tmp, "btmtk.ko")
         with open(self.module, "wb") as module_file:
             module_file.write(b"temporary module fixture")
         self.env = os.environ.copy()
-        for name in ("MOK_KEY", "MOK_CERT", "MOK_SIGNING_KEY", "MOK_CERTIFICATE", "KBUILD_SIGN_KEY", "KBUILD_SIGN_PIN", "SIGN_CONF", "HASH_ALGO", "SIGN_FILE", "kernelver"):
+        for name in ("MOK_KEY", "MOK_CERT", "MOK_SIGNING_KEY", "MOK_CERTIFICATE", "KBUILD_SIGN_KEY", "KBUILD_SIGN_PIN", "SIGN_CONF", "HASH_ALGO", "SIGN_FILE", "kernelver", "MODULES_DIR"):
             self.env.pop(name, None)
 
     def run_signer(self, *args, env=None):
@@ -583,6 +585,15 @@ class TestModuleSigning(unittest.TestCase):
             check=False,
         )
 
+    def make_fake_sign_file(self):
+        idx = len(os.listdir(self.tmp))
+        log = os.path.join(self.tmp, f"sign-file-args-{idx}")
+        fake_sign_file = os.path.join(self.tmp, f"sign-file-{idx}")
+        with open(fake_sign_file, "w", encoding="utf-8") as tool:
+            tool.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SIGN_TEST_LOG\"\n")
+        os.chmod(fake_sign_file, 0o755)
+        return fake_sign_file, log
+
     def test_signing_skips_with_warning_when_not_configured(self):
         result = self.run_signer("sign", "--kernel", "6.12.0", "--module", self.module)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -590,11 +601,7 @@ class TestModuleSigning(unittest.TestCase):
         self.assertIn("Skipping module signing", result.stderr)
 
     def test_configured_signing_calls_kernel_sign_file(self):
-        log = os.path.join(self.tmp, "sign-file-args")
-        fake_sign_file = os.path.join(self.tmp, "sign-file")
-        with open(fake_sign_file, "w", encoding="utf-8") as tool:
-            tool.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SIGN_TEST_LOG\"\n")
-        os.chmod(fake_sign_file, 0o755)
+        fake_sign_file, log = self.make_fake_sign_file()
         env = self.env.copy()
         env["SIGN_TEST_LOG"] = log
         result = self.run_signer(
@@ -616,6 +623,284 @@ class TestModuleSigning(unittest.TestCase):
         result = self.run_signer("sign", "--key", missing_key, "--cert", self.cert)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("MOK private key file not found", result.stderr)
+        self.assertNotIn(missing_key, result.stderr)
+        self.assertNotIn(missing_key, result.stdout)
+
+    def test_private_key_permissions_refuses_insecure_modes(self):
+        fake_sign_file, log = self.make_fake_sign_file()
+        env = self.env.copy()
+        env["SIGN_TEST_LOG"] = log
+        for mode in (0o644, 0o666, 0o640, 0o700, 0o755):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.key, mode)
+                result = self.run_signer(
+                    "sign", "--key", self.key, "--cert", self.cert, "--kernel", "6.12.0",
+                    "--module", self.module, "--sign-file", fake_sign_file, env=env,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("insecure permissions", result.stderr)
+                self.assertNotIn(self.key, result.stderr)
+                self.assertNotIn(self.key, result.stdout)
+
+    def test_private_key_permissions_accepts_0600_and_0400(self):
+        fake_sign_file, log = self.make_fake_sign_file()
+        env = self.env.copy()
+        env["SIGN_TEST_LOG"] = log
+        for mode in (0o600, 0o400):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.key, mode)
+                result = self.run_signer(
+                    "sign", "--key", self.key, "--cert", self.cert, "--kernel", "6.12.0",
+                    "--module", self.module, "--sign-file", fake_sign_file, env=env,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Successfully signed", result.stdout)
+
+    def test_private_key_path_never_printed_on_missing_key(self):
+        missing_key = os.path.join(self.tmp, "super-secret-key-path.priv")
+        result = self.run_signer("sign", "--key", missing_key, "--cert", self.cert)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MOK private key file not found", result.stderr)
+        self.assertNotIn("super-secret-key-path", result.stderr)
+        self.assertNotIn("super-secret-key-path", result.stdout)
+
+    def test_kbuild_sign_pin_never_used_as_cert_and_never_printed(self):
+        env = self.env.copy()
+        env["KBUILD_SIGN_PIN"] = "PIN-MARKER-secret-passphrase-value"
+        result = self.run_signer("sign", "--key", self.key, env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MOK_CERT is missing", result.stderr)
+        self.assertNotIn("PIN-MARKER-secret-passphrase-value", result.stderr)
+        self.assertNotIn("PIN-MARKER-secret-passphrase-value", result.stdout)
+
+    def test_secure_boot_enabled_fails_when_signing_not_configured(self):
+        bin_dir = os.path.join(self.tmp, "bin-sb-on")
+        os.makedirs(bin_dir, exist_ok=True)
+        mock_mokutil = os.path.join(bin_dir, "mokutil")
+        with open(mock_mokutil, "w", encoding="utf-8") as tool:
+            tool.write("#!/bin/sh\necho 'SecureBoot enabled'\nexit 0\n")
+        os.chmod(mock_mokutil, 0o755)
+        env = self.env.copy()
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        result = self.run_signer("sign", "--kernel", "6.12.0", "--module", self.module, env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Secure Boot is enabled, but module signing is not configured", result.stderr)
+
+    def test_secure_boot_disabled_skips_when_signing_not_configured(self):
+        bin_dir = os.path.join(self.tmp, "bin-sb-off")
+        os.makedirs(bin_dir, exist_ok=True)
+        mock_mokutil = os.path.join(bin_dir, "mokutil")
+        with open(mock_mokutil, "w", encoding="utf-8") as tool:
+            tool.write("#!/bin/sh\necho 'SecureBoot disabled'\nexit 0\n")
+        os.chmod(mock_mokutil, 0o755)
+        env = self.env.copy()
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        result = self.run_signer("sign", "--kernel", "6.12.0", "--module", self.module, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Secure Boot signing is not configured", result.stderr)
+        self.assertIn("Skipping module signing", result.stderr)
+
+    def test_dkms_framework_conf_signing(self):
+        fake_sign_file, log = self.make_fake_sign_file()
+        conf = os.path.join(self.tmp, "framework.conf")
+        with open(conf, "w", encoding="utf-8") as f:
+            f.write(f'mok_signing_key="{self.key}"\n'
+                    f'mok_certificate="{self.cert}"\n')
+        env = self.env.copy()
+        env["SIGN_TEST_LOG"] = log
+        result = self.run_signer(
+            "sign", "--config", conf, "--kernel", "6.12.0",
+            "--module", self.module, "--sign-file", fake_sign_file, env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Successfully signed", result.stdout)
+        with open(log, encoding="utf-8") as recorded:
+            self.assertEqual(recorded.read().splitlines(), ["sha256", self.key, self.cert, self.module])
+
+    def test_older_dkms_positional_arguments_supported(self):
+        fake_sign_file, log = self.make_fake_sign_file()
+        env = self.env.copy()
+        env["SIGN_TEST_LOG"] = log
+        result = self.run_signer(
+            "6.12.0", self.module, "--key", self.key, "--cert", self.cert,
+            "--sign-file", fake_sign_file, env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Successfully signed", result.stdout)
+        with open(log, encoding="utf-8") as recorded:
+            self.assertEqual(recorded.read().splitlines(), ["sha256", self.key, self.cert, self.module])
+
+    def test_installed_module_search_order_prioritizes_updates_dkms(self):
+        fake_sign_file, log = self.make_fake_sign_file()
+        modules_dir = os.path.join(self.tmp, "lib", "modules")
+        installed = os.path.join(modules_dir, "6.12.0", "updates", "dkms", "btmtk.ko")
+        os.makedirs(os.path.dirname(installed), exist_ok=True)
+        with open(installed, "wb") as f:
+            f.write(b"installed module fixture")
+        dummy_local = os.path.join(self.tmp, "btmtk.ko")
+        with open(dummy_local, "wb") as f:
+            f.write(b"local uninstalled fixture")
+
+        env = self.env.copy()
+        env["MODULES_DIR"] = modules_dir
+        env["SIGN_TEST_LOG"] = log
+        result = subprocess.run(
+            [self.script, "--config", self.config, "sign", "--key", self.key, "--cert", self.cert,
+             "--kernel", "6.12.0", "--sign-file", fake_sign_file],
+            capture_output=True,
+            text=True,
+            cwd=self.tmp,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Successfully signed", result.stdout)
+        with open(log, encoding="utf-8") as recorded:
+            self.assertEqual(recorded.read().splitlines(), ["sha256", self.key, self.cert, installed])
+
+    def test_sign_compressed_xz_module(self):
+        fake_sign_file = os.path.join(self.tmp, "sign-file-append")
+        with open(fake_sign_file, "w", encoding="utf-8") as tool:
+            tool.write("#!/bin/sh\nprintf 'SIGNED_MARKER' >> \"$4\"\n")
+        os.chmod(fake_sign_file, 0o755)
+
+        xz_mod = os.path.join(self.tmp, "btmtk.ko.xz")
+        with lzma.open(xz_mod, "wb") as f:
+            f.write(b"original raw kernel module")
+
+        result = self.run_signer(
+            "sign", "--key", self.key, "--cert", self.cert, "--kernel", "6.12.0",
+            "--module", xz_mod, "--sign-file", fake_sign_file,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Successfully signed", result.stdout)
+
+        with lzma.open(xz_mod, "rb") as f:
+            content = f.read()
+        self.assertEqual(content, b"original raw kernel moduleSIGNED_MARKER")
+
+    def test_sign_compressed_zst_module(self):
+        bin_dir = os.path.join(self.tmp, "bin-zstd")
+        os.makedirs(bin_dir, exist_ok=True)
+        mock_zstd = os.path.join(bin_dir, "zstd")
+        with open(mock_zstd, "w", encoding="utf-8") as tool:
+            tool.write(
+                "#!/bin/sh\n"
+                "mode=''\n"
+                "out=''\n"
+                "inp=''\n"
+                "while [ $# -gt 0 ]; do\n"
+                "  case \"$1\" in\n"
+                "    -d) mode='decompress'; shift ;;\n"
+                "    -o) out=\"$2\"; shift 2 ;;\n"
+                "    -q|-f|-c) shift ;;\n"
+                "    *) inp=\"$1\"; shift ;;\n"
+                "  esac\n"
+                "done\n"
+                "if [ \"$mode\" = 'decompress' ]; then\n"
+                "  cat \"$inp\"\n"
+                "else\n"
+                "  cat \"$inp\" > \"$out\"\n"
+                "fi\n"
+            )
+        os.chmod(mock_zstd, 0o755)
+
+        fake_sign_file = os.path.join(self.tmp, "sign-file-zst-append")
+        with open(fake_sign_file, "w", encoding="utf-8") as tool:
+            tool.write("#!/bin/sh\nprintf 'ZST_SIGNED' >> \"$4\"\n")
+        os.chmod(fake_sign_file, 0o755)
+
+        zst_mod = os.path.join(self.tmp, "btmtk.ko.zst")
+        with open(zst_mod, "wb") as f:
+            f.write(b"zstd payload")
+
+        env = self.env.copy()
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        result = self.run_signer(
+            "sign", "--key", self.key, "--cert", self.cert, "--kernel", "6.12.0",
+            "--module", zst_mod, "--sign-file", fake_sign_file, env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Successfully signed", result.stdout)
+        with open(zst_mod, "rb") as f:
+            content = f.read()
+        self.assertEqual(content, b"zstd payloadZST_SIGNED")
+
+    def test_hash_algo_allowlist_and_rejection(self):
+        fake_sign_file, _ = self.make_fake_sign_file()
+        for algo in ("sha256", "sha384", "sha512"):
+            with self.subTest(algo=algo):
+                log = os.path.join(self.tmp, f"log-hash-{algo}")
+                env = self.env.copy()
+                env["SIGN_TEST_LOG"] = log
+                result = self.run_signer(
+                    "sign", "--key", self.key, "--cert", self.cert, "--kernel", "6.12.0",
+                    "--module", self.module, "--sign-file", fake_sign_file, "--hash", algo, env=env,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with open(log, encoding="utf-8") as recorded:
+                    self.assertEqual(recorded.read().splitlines()[0], algo)
+
+        for bad in ("md5", "sha1", "$(touch /tmp/bad)"):
+            with self.subTest(bad=bad):
+                result = self.run_signer(
+                    "sign", "--key", self.key, "--cert", self.cert, "--kernel", "6.12.0",
+                    "--module", self.module, "--sign-file", fake_sign_file, "--hash", bad,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Invalid hash algorithm", result.stderr)
+
+    def test_strip_inline_comments_from_config(self):
+        fake_sign_file, log = self.make_fake_sign_file()
+        conf = os.path.join(self.tmp, "commented.conf")
+        with open(conf, "w", encoding="utf-8") as f:
+            f.write(
+                f"MOK_KEY={self.key} # inline private key comment\n"
+                f"MOK_CERT=\"{self.cert}\" # inline certificate comment\n"
+                f"HASH_ALGO=sha384 # inline hash comment\n"
+            )
+        env = self.env.copy()
+        env["SIGN_TEST_LOG"] = log
+        result = self.run_signer(
+            "sign", "--config", conf, "--kernel", "6.12.0",
+            "--module", self.module, "--sign-file", fake_sign_file, env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Successfully signed", result.stdout)
+        with open(log, encoding="utf-8") as recorded:
+            self.assertEqual(recorded.read().splitlines(), ["sha384", self.key, self.cert, self.module])
+
+    def test_configured_sign_file_not_executable_fails(self):
+        bad_sf = os.path.join(self.tmp, "non-exec-sign-file")
+        with open(bad_sf, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(bad_sf, 0o644)
+        result = self.run_signer(
+            "sign", "--key", self.key, "--cert", self.cert, "--kernel", "6.12.0",
+            "--module", self.module, "--sign-file", bad_sf,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Configured sign-file binary is not executable", result.stderr)
+
+    def test_require_consistent_credential_source(self):
+        env = self.env.copy()
+        env["MOK_CERT"] = self.cert
+        result = self.run_signer("sign", "--key", self.key, "--module", self.module, env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MOK_CERT is missing", result.stderr)
+
+        env2 = self.env.copy()
+        env2["MOK_KEY"] = self.key
+        result = self.run_signer("sign", "--cert", self.cert, "--module", self.module, env=env2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MOK_KEY is missing", result.stderr)
+
+        partial_conf = os.path.join(self.tmp, "partial.conf")
+        with open(partial_conf, "w", encoding="utf-8") as f:
+            f.write(f"MOK_KEY={self.key}\n")
+        result = self.run_signer("sign", "--config", partial_conf, "--module", self.module)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MOK_CERT is missing", result.stderr)
 
     def test_enroll_submits_certificate_to_mokutil(self):
         bin_dir = os.path.join(self.tmp, "bin")
