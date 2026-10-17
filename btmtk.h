@@ -141,7 +141,13 @@ struct btmtk_hci_wmt_params {
 	u32 *status;
 };
 
-#define BTMTK_FW_DL_MAX_RETRIES		3
+/* Firmware-download reset retries for MT7922 and MT7925.
+ * fw_dl_retry_count is the module parameter; these are its default and bounds.
+ * 0 disables the reset retry.
+ */
+#define BTMTK_FW_DL_RETRY_DEFAULT	3
+#define BTMTK_FW_DL_RETRY_MIN		0
+#define BTMTK_FW_DL_RETRY_MAX		10
 #define BTMTK_WMT_MAX_RETRIES		3
 
 enum {
