@@ -23,7 +23,15 @@
 
 #include "btmtk.h"
 
-#define VERSION "0.1"
+#define VERSION "0.2.0"
+
+/* Time to wait for the vendor event of each WMT command. The stock value is
+ * HCI_INIT_TIMEOUT (10 s); a stalled firmware download burns all of it before
+ * the reset-and-retry path runs.
+ */
+static unsigned int wmt_timeout_ms = 10000;
+module_param(wmt_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(wmt_timeout_ms, "Timeout in ms for each WMT command (default 10000)");
 
 /* Reset retries after a firmware-download failure on MT7922 and MT7925.
  * 0 disables the reset retry. Values outside the min/max bounds are rejected.
@@ -623,6 +631,7 @@ static int btmtk_usb_hci_wmt_sync(struct hci_dev *hdev,
 	struct btmtk_hci_wmt_evt *wmt_evt;
 	struct btmtk_hci_wmt_cmd *wc;
 	struct btmtk_wmt_hdr *hdr;
+	ktime_t start;
 	int err;
 
 	/* Send the WMT command and wait until the WMT event returns */
@@ -642,6 +651,7 @@ static int btmtk_usb_hci_wmt_sync(struct hci_dev *hdev,
 	memcpy(wc->data, wmt_params->data, wmt_params->dlen);
 
 	set_bit(BTMTK_TX_WAIT_VND_EVT, &data->flags);
+	start = ktime_get();
 
 	/* WMT cmd/event doesn't follow up the generic HCI cmd/event handling,
 	 * it needs constantly polling control pipe until the host received the
@@ -679,7 +689,12 @@ static int btmtk_usb_hci_wmt_sync(struct hci_dev *hdev,
 	 * WMT command.
 	 */
 	err = wait_on_bit_timeout(&data->flags, BTMTK_TX_WAIT_VND_EVT,
-				  TASK_UNINTERRUPTIBLE, HCI_INIT_TIMEOUT);
+				  TASK_UNINTERRUPTIBLE,
+				  msecs_to_jiffies(wmt_timeout_ms));
+
+	bt_dev_dbg(hdev, "WMT op 0x%02x flag %u took %lld us (err %d)",
+		   hdr->op, hdr->flag,
+		   ktime_to_us(ktime_sub(ktime_get(), start)), err);
 
 	if (err) {
 		bt_dev_err(hdev, "Execution of wmt command timed out");

@@ -18,11 +18,11 @@ Linux 6.4 or newer (tested on 6.8, 6.17, 7.0).
 sudo apt install dkms git linux-headers-$(uname -r)
 git clone https://github.com/Josh-Archer/mt7925-bt-recovery.git
 cd mt7925-bt-recovery
-sudo install -d /usr/src/mt7925-bt-recovery-0.1
-sudo install -m 0644 Makefile dkms.conf btmtk.c btmtk.h /usr/src/mt7925-bt-recovery-0.1/
-sudo install -D -m 0755 scripts/sign-module.sh /usr/src/mt7925-bt-recovery-0.1/scripts/sign-module.sh
-sudo dkms add -m mt7925-bt-recovery -v 0.1
-sudo dkms install -m mt7925-bt-recovery -v 0.1
+sudo install -d /usr/src/mt7925-bt-recovery-0.2.0
+sudo install -m 0644 Makefile dkms.conf btmtk.c btmtk.h /usr/src/mt7925-bt-recovery-0.2.0/
+sudo install -D -m 0755 scripts/sign-module.sh /usr/src/mt7925-bt-recovery-0.2.0/scripts/sign-module.sh
+sudo dkms add -m mt7925-bt-recovery -v 0.2.0
+sudo dkms install -m mt7925-bt-recovery -v 0.2.0
 ```
 
 ### Secure Boot
@@ -39,8 +39,8 @@ certificate. For example, with the standard Ubuntu shim-signed key locations:
 ```bash
 export MOK_KEY=/var/lib/shim-signed/mok/MOK.priv
 export MOK_CERT=/var/lib/shim-signed/mok/MOK.der
-sudo --preserve-env=MOK_KEY,MOK_CERT /usr/src/mt7925-bt-recovery-0.1/scripts/sign-module.sh enroll
-sudo --preserve-env=MOK_KEY,MOK_CERT /usr/src/mt7925-bt-recovery-0.1/scripts/sign-module.sh sign
+sudo --preserve-env=MOK_KEY,MOK_CERT /usr/src/mt7925-bt-recovery-0.2.0/scripts/sign-module.sh enroll
+sudo --preserve-env=MOK_KEY,MOK_CERT /usr/src/mt7925-bt-recovery-0.2.0/scripts/sign-module.sh sign
 sudo reboot
 ```
 

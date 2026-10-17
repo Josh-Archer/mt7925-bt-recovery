@@ -171,8 +171,6 @@ struct btmtk_data {
 	const char *drv_name;
 	unsigned long flags;
 	u32 dev_id;
-	u32 fw_dl_retries;
-	u32 wmt_retries;
 	btmtk_reset_sync_func_t reset_sync;
 	struct btmtk_coredump_info cd_info;
 
@@ -188,6 +186,10 @@ struct btmtk_data {
 
 	/* spinlock for ISO data transmission */
 	spinlock_t isorxlock;
+
+	/* Appended, not inserted: stock btusb reads the fields above by offset. */
+	u32 fw_dl_retries;
+	u32 wmt_retries;
 };
 
 typedef int (*wmt_cmd_sync_func_t)(struct hci_dev *,
