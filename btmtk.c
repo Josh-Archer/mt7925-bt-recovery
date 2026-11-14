@@ -3,6 +3,7 @@
  *
  */
 #include <linux/module.h>
+#include <linux/device.h>
 #include <linux/firmware.h>
 #include <linux/usb.h>
 #include <linux/iopoll.h>
@@ -55,6 +56,45 @@ module_param_cb(fw_dl_retry_count, &btmtk_fw_dl_retry_count_ops,
 __MODULE_PARM_TYPE(fw_dl_retry_count, "uint");
 MODULE_PARM_DESC(fw_dl_retry_count,
 		 "Firmware download reset retries for MT7922 and MT7925 (default 3, range 0-10)");
+
+/* Reset-retry counters for one MT7922/MT7925 controller.
+ *
+ * These must not be fields of struct btmtk_data. The in-tree btusb allocates
+ * that struct as hci_dev private data using its own sizeof(), so a field added
+ * by this module would lie past the end of the allocation. They are kept as a
+ * devres on the USB interface instead, which is freed when btusb unbinds: the
+ * same lifetime the hci_dev private data has.
+ */
+struct btmtk_retry_state {
+	u32 fw_dl_retries;
+	u32 wmt_retries;
+};
+
+static void btmtk_retry_state_release(struct device *dev, void *res)
+{
+	/* The devres core frees the memory; there is nothing else to undo. */
+}
+
+/* Setup is serialized per hci_dev, so find-then-add cannot race with itself. */
+static struct btmtk_retry_state *btmtk_retry_state_get(struct btmtk_data *data)
+{
+	struct device *dev = &data->intf->dev;
+	struct btmtk_retry_state *retry;
+
+	retry = devres_find(dev, btmtk_retry_state_release, NULL, NULL);
+	if (retry)
+		return retry;
+
+	/* devres_alloc() returns zeroed memory. */
+	retry = devres_alloc(btmtk_retry_state_release, sizeof(*retry),
+			     GFP_KERNEL);
+	if (!retry)
+		return NULL;
+
+	devres_add(dev, retry);
+
+	return retry;
+}
 
 /* It is for mt79xx download rom patch*/
 #define MTK_FW_ROM_PATCH_HEADER_SIZE	32
@@ -1323,6 +1363,7 @@ EXPORT_SYMBOL_GPL(btmtk_usb_suspend);
 int btmtk_usb_setup(struct hci_dev *hdev)
 {
 	struct btmtk_data *btmtk_data = hci_get_priv(hdev);
+	struct btmtk_retry_state *retry = NULL;
 	struct btmtk_hci_wmt_params wmt_params;
 	ktime_t calltime, delta, rettime;
 	struct btmtk_tci_sleep tci_sleep;
@@ -1382,6 +1423,11 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 		 * Bluetooth interface can still use runtime autosuspend while closed.
 		 */
 		device_set_wakeup_capable(&btmtk_data->udev->dev, false);
+
+		/* Only these two chips use the reset-retry paths below. */
+		retry = btmtk_retry_state_get(btmtk_data);
+		if (!retry)
+			return -ENOMEM;
 		fallthrough;
 	case 0x7961:
 		btmtk_fw_get_filename(fw_bin_name, sizeof(fw_bin_name), dev_id,
@@ -1392,8 +1438,8 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 		if (err < 0) {
 			/* Recover from a MT7925/MT7922 firmware-download failure up to retry limit. */
 			if (dev_id == 0x7925 || dev_id == 0x7922) {
-				if (btmtk_data->fw_dl_retries < fw_dl_retry_count) {
-					btmtk_data->fw_dl_retries++;
+				if (retry->fw_dl_retries < fw_dl_retry_count) {
+					retry->fw_dl_retries++;
 					btmtk_reset_sync(hdev);
 				} else {
 					bt_dev_err(hdev,
@@ -1425,8 +1471,8 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 			bt_dev_err(hdev, "Failed to send wmt func ctrl (%d)", err);
 
 			if (dev_id == 0x7925 && err == -ETIMEDOUT) {
-				if (btmtk_data->wmt_retries < BTMTK_WMT_MAX_RETRIES) {
-					btmtk_data->wmt_retries++;
+				if (retry->wmt_retries < BTMTK_WMT_MAX_RETRIES) {
+					retry->wmt_retries++;
 					btmtk_reset_sync(hdev);
 				} else {
 					bt_dev_err(hdev,
@@ -1440,8 +1486,10 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 
 		hci_set_msft_opcode(hdev, 0xFD30);
 		hci_set_aosp_capable(hdev);
-		btmtk_data->fw_dl_retries = 0;
-		btmtk_data->wmt_retries = 0;
+		if (retry) {
+			retry->fw_dl_retries = 0;
+			retry->wmt_retries = 0;
+		}
 
 		/* Set up ISO interface after protocol enabled */
 		if (test_bit(BTMTK_ISOPKT_OVER_INTR, &btmtk_data->flags)) {

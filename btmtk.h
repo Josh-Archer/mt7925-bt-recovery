@@ -187,9 +187,10 @@ struct btmtk_data {
 	/* spinlock for ISO data transmission */
 	spinlock_t isorxlock;
 
-	/* Appended, not inserted: stock btusb reads the fields above by offset. */
-	u32 fw_dl_retries;
-	u32 wmt_retries;
+	/* Do not add fields. Stock btusb allocates this struct with its own
+	 * sizeof() and reads it by offset, so the layout must match the in-tree
+	 * header exactly. Module-private state belongs in btmtk.c.
+	 */
 };
 
 typedef int (*wmt_cmd_sync_func_t)(struct hci_dev *,

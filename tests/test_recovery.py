@@ -10,7 +10,9 @@ Validates:
 2. Source-level checks on btmtk.c and btmtk.h to verify that:
    - BTMTK_FW_DL_RETRY_DEFAULT/MIN/MAX and BTMTK_WMT_MAX_RETRIES are defined in btmtk.h.
    - fw_dl_retry_count is a module parameter with those bounds, documented for modinfo.
-   - fw_dl_retries and wmt_retries counters are defined in struct btmtk_data.
+   - fw_dl_retries and wmt_retries counters live in the module-private
+     struct btmtk_retry_state, not in struct btmtk_data (which stock btusb
+     allocates with its own sizeof()).
    - Firmware download failure path bounds reset attempts by fw_dl_retry_count.
    - WMT func-ctrl timeout path bounds reset attempts by BTMTK_WMT_MAX_RETRIES.
    - Counters are incremented only when a reset is requested.
@@ -111,30 +113,83 @@ class TestSourceIntegrity(unittest.TestCase):
         self.assertIsNotNone(match, "BTMTK_WMT_MAX_RETRIES must be defined in btmtk.h")
         self.assertEqual(int(match.group(1)), 3, "BTMTK_WMT_MAX_RETRIES should be 3")
 
-    def test_counter_in_btmtk_data(self):
-        """Ensure fw_dl_retries counter is a member of struct btmtk_data."""
+    def test_btmtk_data_not_extended(self):
+        """Ensure struct btmtk_data carries no module-private fields.
+
+        Stock btusb allocates struct btmtk_data as hci_dev private data using
+        the in-tree sizeof(). A field added here would be read and written past
+        the end of that allocation, so the struct must end where upstream's does.
+        """
         struct_match = re.search(
-            r"struct\s+btmtk_data\s*\{([^}]+)\};", self.btmtk_h, re.DOTALL
+            r"struct\s+btmtk_data\s*\{(.*?)\n\};", self.btmtk_h, re.DOTALL
         )
         self.assertIsNotNone(struct_match, "struct btmtk_data definition should exist in btmtk.h")
-        struct_body = struct_match.group(1)
-        self.assertIn(
-            "fw_dl_retries",
-            struct_body,
-            "fw_dl_retries counter must be a field in struct btmtk_data",
+        struct_body = re.sub(r"/\*.*?\*/", "", struct_match.group(1), flags=re.DOTALL)
+        for counter in ("fw_dl_retries", "wmt_retries"):
+            self.assertNotIn(
+                counter,
+                struct_body,
+                f"{counter} must not be a field of struct btmtk_data (stock btusb sizes it)",
+            )
+        fields = [line.strip() for line in struct_body.splitlines() if line.strip()]
+        self.assertEqual(
+            fields[-1],
+            "spinlock_t isorxlock;",
+            "struct btmtk_data must end with upstream's last field, isorxlock",
         )
 
-    def test_wmt_counter_in_btmtk_data(self):
-        """Ensure wmt_retries counter is a member of struct btmtk_data."""
+    def test_counters_in_private_retry_state(self):
+        """Ensure both retry counters are fields of btmtk.c's struct btmtk_retry_state."""
         struct_match = re.search(
-            r"struct\s+btmtk_data\s*\{([^}]+)\};", self.btmtk_h, re.DOTALL
+            r"struct\s+btmtk_retry_state\s*\{([^}]+)\};", self.btmtk_c, re.DOTALL
         )
-        self.assertIsNotNone(struct_match, "struct btmtk_data definition should exist in btmtk.h")
+        self.assertIsNotNone(
+            struct_match, "struct btmtk_retry_state definition should exist in btmtk.c"
+        )
         struct_body = struct_match.group(1)
-        self.assertIn(
-            "wmt_retries",
-            struct_body,
-            "wmt_retries counter must be a field in struct btmtk_data",
+        for counter in ("fw_dl_retries", "wmt_retries"):
+            self.assertRegex(
+                struct_body,
+                rf"u32\s+{counter}\s*;",
+                f"{counter} must be a u32 field of struct btmtk_retry_state",
+            )
+        self.assertNotIn(
+            "btmtk_retry_state",
+            self.btmtk_h,
+            "struct btmtk_retry_state is module-private and must stay out of btmtk.h",
+        )
+
+    def test_retry_state_is_interface_devres(self):
+        """Ensure the retry state is a devres on the USB interface, found before allocating."""
+        func_match = re.search(
+            r"btmtk_retry_state_get\s*\(\s*struct\s+btmtk_data\s*\*\s*data\s*\)\s*\{(.*?)\n\}",
+            self.btmtk_c,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(func_match, "btmtk_retry_state_get() should exist in btmtk.c")
+        body = func_match.group(1)
+        self.assertRegex(body, r"&\s*data->intf->dev", "retry state must hang off the USB interface")
+        find = body.find("devres_find")
+        alloc = body.find("devres_alloc")
+        add = body.find("devres_add")
+        self.assertTrue(
+            -1 < find < alloc < add,
+            "btmtk_retry_state_get() must reuse an existing devres before allocating a new one",
+        )
+
+    def test_retry_state_fetched_for_recovery_chips(self):
+        """Ensure setup fetches the retry state in the MT7922/MT7925 case and fails on -ENOMEM."""
+        pattern = re.compile(
+            r"case\s+0x7922\s*:\s*case\s+0x7925\s*:(?:(?!case\s+0x7961).)*?"
+            r"retry\s*=\s*btmtk_retry_state_get\s*\(\s*btmtk_data\s*\)\s*;\s*"
+            r"if\s*\(\s*!retry\s*\)\s*return\s+-ENOMEM\s*;\s*"
+            r"fallthrough\s*;\s*case\s+0x7961\s*:",
+            re.DOTALL,
+        )
+        self.assertRegex(
+            self.btmtk_c,
+            pattern,
+            "MT7922/MT7925 setup must obtain the retry state before the shared 79xx path",
         )
 
     def test_no_test_and_set_bit_on_fw_download_failure(self):
@@ -277,21 +332,22 @@ class TestSourceIntegrity(unittest.TestCase):
 
     def test_counter_reset_on_setup_completion(self):
         """Ensure retry counters are reset to 0 once setup fully completes."""
-        pattern_fw = re.compile(
-            r"btmtk_data->fw_dl_retries\s*=\s*0\s*;",
+        pattern = re.compile(
+            r"hci_set_aosp_capable\s*\(\s*hdev\s*\)\s*;\s*"
+            r"if\s*\(\s*retry\s*\)\s*\{\s*"
+            r"retry->fw_dl_retries\s*=\s*0\s*;\s*"
+            r"retry->wmt_retries\s*=\s*0\s*;\s*\}",
         )
         self.assertRegex(
             self.btmtk_c,
-            pattern_fw,
-            "Setup completion path must reset btmtk_data->fw_dl_retries to 0",
+            pattern,
+            "Setup completion path must reset both retry counters to 0 "
+            "(retry is NULL for chips without reset recovery, e.g. MT7961)",
         )
-        pattern_wmt = re.compile(
-            r"btmtk_data->wmt_retries\s*=\s*0\s*;",
-        )
-        self.assertRegex(
+        self.assertNotRegex(
             self.btmtk_c,
-            pattern_wmt,
-            "Setup completion path must reset btmtk_data->wmt_retries to 0",
+            r"btmtk_data->(?:fw_dl_retries|wmt_retries)",
+            "Retry counters must not be accessed through struct btmtk_data",
         )
 
     def test_unaligned_include_guarded(self):
